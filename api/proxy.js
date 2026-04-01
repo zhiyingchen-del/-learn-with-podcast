@@ -1,4 +1,7 @@
-export default async function handler(req, res) {
+import https from "https";
+import http from "http";
+
+export default function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -16,48 +19,56 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Invalid URL" });
   }
 
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 50000);
+  const parsedUrl = new URL(targetUrl);
+  const lib = parsedUrl.protocol === "https:" ? https : http;
 
-    const response = await fetch(targetUrl, {
-      signal: controller.signal,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": type === "audio"
-          ? "audio/mpeg, audio/*, */*"
-          : "application/rss+xml, application/xml, text/xml, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-      redirect: "follow",
-    });
+  const options = {
+    hostname: parsedUrl.hostname,
+    path: parsedUrl.pathname + parsedUrl.search,
+    method: "GET",
+    headers: {
+      "User-Agent": "Mozilla/5.0 (compatible; PodcastLearner/1.0)",
+      "Accept": type === "audio"
+        ? "audio/mpeg, audio/*, */*"
+        : "application/rss+xml, application/xml, text/xml, */*",
+    },
+  };
 
-    clearTimeout(timeout);
-
-    if (!response.ok) {
-      return res.status(response.status).json({
-        error: "Upstream " + response.status + ": " + response.statusText,
+  const proxyReq = lib.request(options, (proxyRes) => {
+    // Handle redirects
+    if (proxyRes.statusCode >= 300 && proxyRes.statusCode < 400 && proxyRes.headers.location) {
+      const redirectUrl = proxyRes.headers.location;
+      const redirectParsed = new URL(redirectUrl, targetUrl);
+      const redirectLib = redirectParsed.protocol === "https:" ? https : http;
+      const redirectOptions = {
+        hostname: redirectParsed.hostname,
+        path: redirectParsed.pathname + redirectParsed.search,
+        method: "GET",
+        headers: options.headers,
+      };
+      const redirectReq = redirectLib.request(redirectOptions, (redirectRes) => {
+        res.setHeader("Content-Type", redirectRes.headers["content-type"] || (type === "audio" ? "audio/mpeg" : "application/xml"));
+        res.status(redirectRes.statusCode);
+        redirectRes.pipe(res);
       });
+      redirectReq.on("error", (e) => res.status(500).json({ error: e.message }));
+      redirectReq.end();
+      return;
     }
 
-    const contentType = response.headers.get("content-type") || "";
-
-    if (type === "audio") {
-      res.setHeader("Content-Type", contentType || "audio/mpeg");
-      const contentLength = response.headers.get("content-length");
-      if (contentLength) res.setHeader("Content-Length", contentLength);
-      const buffer = await response.arrayBuffer();
-      return res.send(Buffer.from(buffer));
-    } else {
-      res.setHeader("Content-Type", "text/plain; charset=utf-8");
-      const text = await response.text();
-      return res.send(text);
+    if (proxyRes.statusCode !== 200) {
+      return res.status(proxyRes.statusCode).json({ error: "Upstream " + proxyRes.statusCode });
     }
-  } catch (err) {
-    return res.status(500).json({
-      error: err.message,
-      name: err.name,
-      target: targetUrl,
-    });
-  }
+
+    res.setHeader("Content-Type", proxyRes.headers["content-type"] || (type === "audio" ? "audio/mpeg" : "application/xml"));
+    if (proxyRes.headers["content-length"]) {
+      res.setHeader("Content-Length", proxyRes.headers["content-length"]);
+    }
+    res.status(200);
+    proxyRes.pipe(res);
+  });
+
+  proxyReq.on("error", (e) => res.status(500).json({ error: e.message, target: targetUrl }));
+  proxyReq.setTimeout(55000, () => { proxyReq.destroy(); res.status(504).json({ error: "Timeout" }); });
+  proxyReq.end();
 }
