@@ -1,14 +1,1393 @@
 <!DOCTYPE html>
 <html lang="zh-TW">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Learn with Podcast</title>
-    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙️</text></svg>" />
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="./src/main.jsx"></script>
-  </body>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Learn with Podcast</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙️</text></svg>" />
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel" data-presets="react">
+const { useState, useRef, useEffect, useCallback } = React;
+ 
+// ============================================================
+// STORAGE HELPERS (localStorage)
+// ============================================================
+const LS_KEYS = { cards: "lwp_flashcards", episodes: "lwp_episodes", settings: "lwp_settings" };
+const lsGet = (k, def) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : def; } catch { return def; } };
+const lsSet = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+ 
+// ============================================================
+// API HELPERS
+// ============================================================
+const CORS_PROXY = "https://corsproxy.io/?";
+ 
+async function parseRSS(url) {
+  const res = await fetch(CORS_PROXY + encodeURIComponent(url));
+  if (!res.ok) throw new Error("無法取得 RSS Feed，請確認網址是否正確");
+  const text = await res.text();
+  const parser = new DOMParser();
+  const xml = parser.parseFromString(text, "text/xml");
+  const channelTitle = xml.querySelector("channel > title")?.textContent || "未知 Podcast";
+  const items = Array.from(xml.querySelectorAll("item"));
+  return {
+    podcastName: channelTitle,
+    episodes: items.map((item, i) => {
+      const enclosure = item.querySelector("enclosure");
+      const duration = item.querySelector("duration")?.textContent || "";
+      const pubDate = item.querySelector("pubDate")?.textContent || "";
+      return {
+        id: `rss-${i}-${Date.now()}`,
+        title: item.querySelector("title")?.textContent || `Episode ${i + 1}`,
+        podcast: channelTitle,
+        date: pubDate ? new Date(pubDate).toLocaleDateString("zh-TW") : "",
+        duration: duration,
+        audioUrl: enclosure?.getAttribute("url") || "",
+        language: "en",
+        hasTranscript: false,
+        transcript: [],
+      };
+    }).filter(ep => ep.audioUrl),
+  };
+}
+ 
+async function transcribeAudio(audioUrl, openaiKey, language) {
+  // Fetch audio via proxy then send to Whisper
+  const proxyUrl = CORS_PROXY + encodeURIComponent(audioUrl);
+  const audioRes = await fetch(proxyUrl);
+  if (!audioRes.ok) throw new Error("無法下載音訊檔案");
+  const audioBlob = await audioRes.blob();
+ 
+  const formData = new FormData();
+  formData.append("file", audioBlob, "audio.mp3");
+  formData.append("model", "whisper-1");
+  formData.append("language", language === "fr" ? "fr" : "en");
+  formData.append("response_format", "verbose_json");
+  formData.append("timestamp_granularities[]", "segment");
+ 
+  const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${openaiKey}` },
+    body: formData,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.error?.message || `Whisper API 錯誤：${res.status}`);
+  }
+  const data = await res.json();
+  return (data.segments || []).map((seg, i) => ({
+    id: i,
+    start: seg.start,
+    end: seg.end,
+    text: seg.text.trim(),
+  }));
+}
+ 
+async function claudeCall(prompt, claudeKey, maxTokens = 1000) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": claudeKey,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: maxTokens,
+      messages: [{ role: "user", content: prompt }],
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.error?.message || `Claude API 錯誤：${res.status}`);
+  }
+  const data = await res.json();
+  return data.content.map(b => b.text || "").join("").replace(/```json|```/g, "").trim();
+}
+ 
+async function lookupWord(word, sentence, language, claudeKey) {
+  const langName = language === "fr" ? "法文" : "英文";
+  const frExtra = language === "fr" ? `,
+  "gender": "陽性(m.) 或 陰性(f.) 或 兩者皆可(m./f.)，若不適用填null",
+  "conjugation": "若為動詞列出現在式：je/tu/il/nous/vous/ils，否則填null"` : "";
+  const prompt = `你是${langName}語言學習助手，幫助中文母語者。請分析以下單字並以JSON回應（只回傳JSON不要其他文字）：
+單字：${word}
+所在句子：${sentence}
+語言：${langName}
+格式：{"word":"${word}","partOfSpeech":"詞性","pronunciation":"IPA音標","translation":"中文翻譯","examples":[{"original":"例句1","translation":"中文1"},{"original":"例句2（生活化）","translation":"中文2"}]${frExtra}}`;
+  const text = await claudeCall(prompt, claudeKey, 1000);
+  return JSON.parse(text);
+}
+ 
+async function generateMoreExamples(word, translation, language, claudeKey) {
+  const langName = language === "fr" ? "法文" : "英文";
+  const prompt = `為「${word}」（中文：${translation}）生成3個生活化${langName}例句，場景多元。只回傳JSON陣列：[{"original":"例句","translation":"中文翻譯"},...]`;
+  const text = await claudeCall(prompt, claudeKey, 600);
+  return JSON.parse(text);
+}
+ 
+async function getSynonyms(word, claudeKey) {
+  const prompt = `為「${word}」列出近義詞和反義詞。只回傳JSON：{"synonyms":["詞1","詞2","詞3"],"antonyms":["詞1","詞2"]}`;
+  const text = await claudeCall(prompt, claudeKey, 300);
+  return JSON.parse(text);
+}
+ 
+async function getFrConjugation(word, claudeKey) {
+  const prompt = `請列出法文動詞「${word}」的完整變化表（現在式、過去式、未來式）。只回傳JSON：{"present":{"je":"","tu":"","il":"","nous":"","vous":"","ils":""},"passe":{"je":"","tu":"","il":"","nous":"","vous":"","ils":""},"futur":{"je":"","tu":"","il":"","nous":"","vous":"","ils":""}}`;
+  const text = await claudeCall(prompt, claudeKey, 500);
+  return JSON.parse(text);
+}
+ 
+async function generateQuiz(flashcards, transcript, claudeKey) {
+  const cards = flashcards.slice(0, 12).map(c =>
+    `${c.word}(${c.partOfSpeech})=${c.translation}｜例：${c.exampleOriginal.slice(0, 80)}`
+  ).join("\n");
+  const transcriptText = transcript.map(s => s.text).join(" ").slice(0, 600);
+  const prompt = `你是語言測驗出題老師，根據以下單字和文本生成6道測驗題，涵蓋5種題型（en_to_zh/zh_to_en/cloze/pick_sentence/fill各至少一題）。只回傳JSON陣列。
+ 
+單字：
+${cards}
+ 
+文本：${transcriptText}
+ 
+JSON格式（嚴格遵守）：
+[
+  {"type":"en_to_zh","word":"單字","partOfSpeech":"n.","options":["正確中文","錯誤1","錯誤2","錯誤3"],"answer":0},
+  {"type":"zh_to_en","chineseWord":"中文意思","partOfSpeech":"adj.","options":["正確英文","錯誤1","錯誤2","錯誤3"],"answer":0},
+  {"type":"cloze","word":"單字","sentenceBefore":"句子前半","sentenceAfter":"句子後半","sentenceTranslation":"中文翻譯含___","options":["正確","錯誤1","錯誤2","錯誤3"],"answer":0},
+  {"type":"pick_sentence","word":"單字","translation":"中文","options":["正確例句","錯誤句1","錯誤句2","錯誤句3"],"correctIdx":0,"note":"解析說明"},
+  {"type":"fill","chineseHint":"中文意思","partOfSpeech":"n.","sentence":"含_____的句子","sentenceTranslation":"中文版含___","answer":"正確單字"},
+  {"type":"en_to_zh","word":"另一單字","partOfSpeech":"v.","options":["正確中文","錯誤1","錯誤2","錯誤3"],"answer":0}
+]`;
+  const text = await claudeCall(prompt, claudeKey, 2000);
+  return JSON.parse(text);
+}
+ 
+// ============================================================
+// ICONS
+// ============================================================
+const Icon = ({ name, size = 18 }) => {
+  const icons = {
+    play: <polygon points="5,3 19,12 5,21" fill="currentColor" />,
+    pause: <><rect x="6" y="4" width="4" height="16" fill="currentColor"/><rect x="14" y="4" width="4" height="16" fill="currentColor"/></>,
+    skip: <><polygon points="5,4 15,12 5,20" fill="currentColor"/><rect x="15" y="4" width="3" height="16" fill="currentColor"/></>,
+    rewind: <><polygon points="19,4 9,12 19,20" fill="currentColor"/><rect x="6" y="4" width="3" height="16" fill="currentColor"/></>,
+    volume: <><polygon points="11,5 6,9 2,9 2,15 6,15 11,19" fill="currentColor"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07" stroke="currentColor" strokeWidth="2" fill="none"/></>,
+    bookmark: <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" stroke="currentColor" strokeWidth="2" fill="none"/>,
+    bookmarkFilled: <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" fill="currentColor"/>,
+    x: <><line x1="18" y1="6" x2="6" y2="18" stroke="currentColor" strokeWidth="2"/><line x1="6" y1="6" x2="18" y2="18" stroke="currentColor" strokeWidth="2"/></>,
+    plus: <><line x1="12" y1="5" x2="12" y2="19" stroke="currentColor" strokeWidth="2"/><line x1="5" y1="12" x2="19" y2="12" stroke="currentColor" strokeWidth="2"/></>,
+    search: <><circle cx="11" cy="11" r="8" stroke="currentColor" strokeWidth="2" fill="none"/><line x1="21" y1="21" x2="16.65" y2="16.65" stroke="currentColor" strokeWidth="2"/></>,
+    rss: <><path d="M4 11a9 9 0 0 1 9 9" stroke="currentColor" strokeWidth="2" fill="none"/><path d="M4 4a16 16 0 0 1 16 16" stroke="currentColor" strokeWidth="2" fill="none"/><circle cx="5" cy="19" r="1" fill="currentColor"/></>,
+    link: <><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" stroke="currentColor" strokeWidth="2" fill="none"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" stroke="currentColor" strokeWidth="2" fill="none"/></>,
+    mic: <><rect x="9" y="2" width="6" height="11" rx="3" stroke="currentColor" strokeWidth="2" fill="none"/><path d="M19 10v2a7 7 0 0 1-14 0v-2" stroke="currentColor" strokeWidth="2" fill="none"/><line x1="12" y1="19" x2="12" y2="22" stroke="currentColor" strokeWidth="2"/></>,
+    layers: <><polygon points="12,2 2,7 12,12 22,7" stroke="currentColor" strokeWidth="2" fill="none"/><polyline points="2,17 12,22 22,17" stroke="currentColor" strokeWidth="2" fill="none"/><polyline points="2,12 12,17 22,12" stroke="currentColor" strokeWidth="2" fill="none"/></>,
+    brain: <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 15v-4H7l5-8v4h4l-5 8z" fill="currentColor"/>,
+    settings: <><circle cx="12" cy="12" r="3" stroke="currentColor" strokeWidth="2" fill="none"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" stroke="currentColor" strokeWidth="2" fill="none"/></>,
+    chevronRight: <polyline points="9,18 15,12 9,6" stroke="currentColor" strokeWidth="2" fill="none"/>,
+    trash: <><polyline points="3,6 5,6 21,6" stroke="currentColor" strokeWidth="2" fill="none"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" stroke="currentColor" strokeWidth="2" fill="none"/><path d="M10 11v6M14 11v6" stroke="currentColor" strokeWidth="2" fill="none"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" stroke="currentColor" strokeWidth="2" fill="none"/></>,
+    repeat: <><polyline points="17,1 21,5 17,9" stroke="currentColor" strokeWidth="2" fill="none"/><path d="M3 11V9a4 4 0 0 1 4-4h14" stroke="currentColor" strokeWidth="2" fill="none"/><polyline points="7,23 3,19 7,15" stroke="currentColor" strokeWidth="2" fill="none"/><path d="M21 13v2a4 4 0 0 1-4 4H3" stroke="currentColor" strokeWidth="2" fill="none"/></>,
+    check: <polyline points="20,6 9,17 4,12" stroke="currentColor" strokeWidth="2.5" fill="none"/>,
+    eye: <><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" stroke="currentColor" strokeWidth="2" fill="none"/><circle cx="12" cy="12" r="3" stroke="currentColor" strokeWidth="2" fill="none"/></>,
+    eyeOff: <><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" stroke="currentColor" strokeWidth="2" fill="none"/><line x1="1" y1="1" x2="23" y2="23" stroke="currentColor" strokeWidth="2"/></>,
+    rotate: <><polyline points="23,4 23,10 17,10" stroke="currentColor" strokeWidth="2" fill="none"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" stroke="currentColor" strokeWidth="2" fill="none"/></>,
+    upload: <><polyline points="16 16 12 12 8 16" stroke="currentColor" strokeWidth="2" fill="none"/><line x1="12" y1="12" x2="12" y2="21" stroke="currentColor" strokeWidth="2"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3" stroke="currentColor" strokeWidth="2" fill="none"/></>,
+    alertCircle: <><circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="2" fill="none"/><line x1="12" y1="8" x2="12" y2="12" stroke="currentColor" strokeWidth="2"/><line x1="12" y1="16" x2="12.01" y2="16" stroke="currentColor" strokeWidth="2"/></>,
+    loader: <><line x1="12" y1="2" x2="12" y2="6" stroke="currentColor" strokeWidth="2"/><line x1="12" y1="18" x2="12" y2="22" stroke="currentColor" strokeWidth="2"/><line x1="4.93" y1="4.93" x2="7.76" y2="7.76" stroke="currentColor" strokeWidth="2"/><line x1="16.24" y1="16.24" x2="19.07" y2="19.07" stroke="currentColor" strokeWidth="2"/><line x1="2" y1="12" x2="6" y2="12" stroke="currentColor" strokeWidth="2"/><line x1="18" y1="12" x2="22" y2="12" stroke="currentColor" strokeWidth="2"/><line x1="4.93" y1="19.07" x2="7.76" y2="16.24" stroke="currentColor" strokeWidth="2"/><line x1="16.24" y1="7.76" x2="19.07" y2="4.93" stroke="currentColor" strokeWidth="2"/></>,
+  };
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" style={{ display: "inline-block", verticalAlign: "middle", flexShrink: 0 }}>
+      {icons[name] || null}
+    </svg>
+  );
+};
+ 
+// ============================================================
+// STYLES
+// ============================================================
+const styles = `
+  @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;600;700&family=DM+Mono:wght@400;500&family=Outfit:wght@300;400;500;600;700&display=swap');
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg:#0f0f13; --bg2:#16161d; --bg3:#1d1d26; --bg4:#252530; --surface:#1a1a24;
+    --border:rgba(255,255,255,0.07); --border2:rgba(255,255,255,0.12);
+    --text:#e8e8f0; --text2:#9898b0; --text3:#5a5a70;
+    --accent:#7c6fef; --accent2:#a59bf5; --accent-bg:rgba(124,111,239,0.12); --accent-border:rgba(124,111,239,0.3);
+    --gold:#e8b84b; --gold-bg:rgba(232,184,75,0.1);
+    --teal:#4ecdc4; --teal-bg:rgba(78,205,196,0.1);
+    --coral:#ff6b6b; --coral-bg:rgba(255,107,107,0.1);
+    --green:#51cf66; --green-bg:rgba(81,207,102,0.1);
+    --radius:10px; --radius-lg:16px; --radius-xl:22px;
+    --font:'Outfit','Noto Sans TC',sans-serif;
+    --font-zh:'Noto Sans TC',sans-serif;
+    --font-mono:'DM Mono',monospace;
+    --shadow:0 4px 24px rgba(0,0,0,0.4); --shadow-lg:0 8px 40px rgba(0,0,0,0.6);
+  }
+  body { background:var(--bg); color:var(--text); font-family:var(--font); }
+  ::-webkit-scrollbar { width:4px; height:4px; }
+  ::-webkit-scrollbar-track { background:transparent; }
+  ::-webkit-scrollbar-thumb { background:var(--border2); border-radius:4px; }
+  .app { display:flex; height:100vh; overflow:hidden; }
+  .sidebar { width:220px; flex-shrink:0; background:var(--bg2); border-right:1px solid var(--border); display:flex; flex-direction:column; padding:20px 0; gap:4px; }
+  .sidebar-logo { padding:0 20px 20px; border-bottom:1px solid var(--border); margin-bottom:8px; }
+  .sidebar-logo h1 { font-size:16px; font-weight:700; letter-spacing:-0.5px; line-height:1.3; }
+  .sidebar-logo h1 span { color:var(--accent2); }
+  .sidebar-logo p { font-size:11px; color:var(--text3); margin-top:3px; }
+  .nav-item { display:flex; align-items:center; gap:10px; padding:9px 20px; font-size:13.5px; color:var(--text2); cursor:pointer; transition:all 0.15s; font-weight:400; border:none; background:none; width:100%; text-align:left; }
+  .nav-item:hover { color:var(--text); background:rgba(255,255,255,0.04); }
+  .nav-item.active { color:var(--accent2); background:var(--accent-bg); font-weight:500; }
+  .main { flex:1; display:flex; flex-direction:column; overflow:hidden; }
+  .topbar { height:56px; border-bottom:1px solid var(--border); display:flex; align-items:center; padding:0 24px; gap:12px; flex-shrink:0; background:var(--bg2); }
+  .topbar h2 { font-size:16px; font-weight:600; flex:1; }
+  .content { flex:1; overflow-y:auto; padding:24px; }
+  .btn { display:inline-flex; align-items:center; gap:6px; padding:8px 16px; border-radius:var(--radius); font-size:13px; font-weight:500; cursor:pointer; border:1px solid transparent; transition:all 0.15s; font-family:var(--font); white-space:nowrap; }
+  .btn-primary { background:var(--accent); color:white; border-color:var(--accent); }
+  .btn-primary:hover { background:var(--accent2); border-color:var(--accent2); }
+  .btn-primary:disabled { opacity:0.5; cursor:not-allowed; }
+  .btn-ghost { background:transparent; color:var(--text2); border-color:var(--border2); }
+  .btn-ghost:hover { background:rgba(255,255,255,0.05); color:var(--text); }
+  .btn-danger { background:var(--coral-bg); color:var(--coral); border-color:rgba(255,107,107,0.2); }
+  .btn-danger:hover { background:rgba(255,107,107,0.2); }
+  .btn-sm { padding:5px 10px; font-size:12px; }
+  .btn-icon { padding:7px; border-radius:8px; }
+  .card { background:var(--bg3); border:1px solid var(--border); border-radius:var(--radius-lg); padding:20px; }
+  .badge { display:inline-flex; align-items:center; gap:4px; padding:3px 8px; border-radius:20px; font-size:11px; font-weight:500; }
+  .badge-en { background:var(--accent-bg); color:var(--accent2); border:1px solid var(--accent-border); }
+  .badge-fr { background:var(--gold-bg); color:var(--gold); border:1px solid rgba(232,184,75,0.3); }
+  .badge-unknown { background:rgba(255,107,107,0.1); color:var(--coral); border:1px solid rgba(255,107,107,0.2); }
+  .badge-fuzzy { background:rgba(232,184,75,0.1); color:var(--gold); border:1px solid rgba(232,184,75,0.2); }
+  .badge-mastered { background:var(--green-bg); color:var(--green); border:1px solid rgba(81,207,102,0.2); }
+  .input { background:var(--bg4); border:1px solid var(--border2); border-radius:var(--radius); padding:10px 14px; font-size:13.5px; color:var(--text); font-family:var(--font); width:100%; transition:border-color 0.15s; outline:none; }
+  .input:focus { border-color:var(--accent); }
+  .input::placeholder { color:var(--text3); }
+  .episode-item { display:flex; align-items:center; gap:14px; padding:14px 18px; background:var(--bg3); border:1px solid var(--border); border-radius:var(--radius-lg); cursor:pointer; transition:all 0.15s; margin-bottom:8px; }
+  .episode-item:hover { border-color:var(--border2); background:var(--bg4); }
+  .episode-item.active { border-color:var(--accent-border); background:var(--accent-bg); }
+  .episode-thumb { width:52px; height:52px; border-radius:10px; background:linear-gradient(135deg,var(--accent) 0%,#4a3fa0 100%); display:flex; align-items:center; justify-content:center; font-size:22px; flex-shrink:0; }
+  .episode-info { flex:1; min-width:0; }
+  .episode-title { font-size:14px; font-weight:500; margin-bottom:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .episode-meta { font-size:12px; color:var(--text2); display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .player { background:var(--bg2); border-top:1px solid var(--border); padding:16px 24px; flex-shrink:0; }
+  .player-top { display:flex; align-items:center; gap:14px; margin-bottom:12px; }
+  .player-info { flex:1; min-width:0; }
+  .player-title { font-size:14px; font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .player-sub { font-size:12px; color:var(--text2); margin-top:2px; }
+  .player-controls { display:flex; align-items:center; gap:8px; }
+  .play-btn { width:40px; height:40px; border-radius:50%; background:var(--accent); border:none; cursor:pointer; display:flex; align-items:center; justify-content:center; color:white; transition:all 0.15s; flex-shrink:0; }
+  .play-btn:hover { background:var(--accent2); transform:scale(1.05); }
+  .ctrl-btn { background:none; border:none; cursor:pointer; color:var(--text2); padding:6px; border-radius:6px; display:flex; align-items:center; }
+  .ctrl-btn:hover { color:var(--text); background:rgba(255,255,255,0.06); }
+  .speed-btn { background:var(--bg4); border:1px solid var(--border2); color:var(--text2); border-radius:6px; padding:3px 8px; font-size:12px; font-family:var(--font-mono); cursor:pointer; }
+  .speed-btn:hover { border-color:var(--accent); color:var(--accent2); }
+  .progress-bar { position:relative; height:4px; background:var(--bg4); border-radius:4px; cursor:pointer; margin-bottom:8px; }
+  .progress-fill { height:100%; background:var(--accent); border-radius:4px; position:relative; transition:width 0.1s; }
+  .progress-fill::after { content:''; position:absolute; right:-5px; top:-4px; width:12px; height:12px; background:white; border-radius:50%; box-shadow:0 0 0 2px var(--accent); }
+  .time-row { display:flex; justify-content:space-between; font-size:11px; color:var(--text3); font-family:var(--font-mono); }
+  .transcript-sentence { padding:10px 14px; border-radius:8px; cursor:pointer; transition:all 0.1s; line-height:1.7; font-size:14.5px; border-left:3px solid transparent; margin-bottom:2px; }
+  .transcript-sentence:hover { background:rgba(255,255,255,0.04); }
+  .transcript-sentence.active { background:var(--accent-bg); border-left-color:var(--accent); }
+  .transcript-time { font-size:11px; color:var(--text3); font-family:var(--font-mono); margin-bottom:3px; }
+  .word-clickable { cursor:pointer; border-radius:3px; padding:0 1px; transition:all 0.1s; }
+  .word-clickable:hover { background:rgba(124,111,239,0.25); color:var(--accent2); }
+  .word-panel { position:fixed; right:0; top:0; bottom:0; width:350px; background:var(--bg2); border-left:1px solid var(--border); z-index:100; display:flex; flex-direction:column; transform:translateX(100%); transition:transform 0.25s cubic-bezier(0.4,0,0.2,1); box-shadow:var(--shadow-lg); }
+  .word-panel.open { transform:translateX(0); }
+  .word-panel-header { padding:20px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:flex-start; }
+  .word-panel-body { flex:1; overflow-y:auto; padding:20px; display:flex; flex-direction:column; gap:16px; }
+  .word-main { font-size:28px; font-weight:700; letter-spacing:-0.5px; }
+  .word-pron { font-size:13px; color:var(--teal); font-family:var(--font-mono); margin-top:4px; }
+  .word-pos { font-size:12px; color:var(--text3); background:var(--bg4); padding:2px 8px; border-radius:20px; display:inline-block; margin-top:6px; }
+  .word-translation { font-size:22px; font-family:var(--font-zh); color:var(--gold); font-weight:600; }
+  .section-label { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.8px; color:var(--text3); margin-bottom:8px; }
+  .example-card { background:var(--bg4); border-radius:10px; padding:14px; margin-bottom:8px; }
+  .example-original { font-size:13.5px; line-height:1.6; margin-bottom:8px; }
+  .example-translation { font-size:12.5px; color:var(--text2); font-family:var(--font-zh); line-height:1.6; }
+  .flashcard-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(290px,1fr)); gap:14px; }
+  .flashcard { background:var(--bg3); border:1px solid var(--border); border-radius:var(--radius-lg); padding:18px; cursor:pointer; transition:all 0.15s; position:relative; }
+  .flashcard:hover { border-color:var(--border2); transform:translateY(-1px); box-shadow:var(--shadow); }
+  .flashcard.pinned { border-left:3px solid var(--accent); }
+  .flashcard-word { font-size:20px; font-weight:700; letter-spacing:-0.3px; }
+  .flashcard-pos { font-size:11px; color:var(--text3); margin-top:2px; }
+  .flashcard-translation { font-size:15px; font-family:var(--font-zh); color:var(--gold); margin:8px 0; }
+  .flashcard-example { font-size:12px; color:var(--text2); line-height:1.5; border-left:2px solid var(--border2); padding-left:10px; }
+  .flashcard-footer { display:flex; gap:6px; align-items:center; margin-top:12px; flex-wrap:wrap; }
+  .filter-bar { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:20px; }
+  .filter-btn { padding:6px 14px; border-radius:20px; font-size:12.5px; font-weight:500; cursor:pointer; border:1px solid var(--border2); background:transparent; color:var(--text2); transition:all 0.15s; font-family:var(--font); }
+  .filter-btn:hover { color:var(--text); border-color:var(--text3); }
+  .filter-btn.active { background:var(--accent-bg); color:var(--accent2); border-color:var(--accent-border); }
+  .quiz-card { background:var(--bg3); border:1px solid var(--border); border-radius:var(--radius-xl); padding:32px; max-width:640px; margin:0 auto; }
+  .quiz-option { padding:14px 18px; border:1px solid var(--border2); border-radius:var(--radius); cursor:pointer; transition:all 0.15s; font-size:14px; margin-bottom:10px; background:var(--bg4); }
+  .quiz-option:hover { border-color:var(--accent-border); background:var(--accent-bg); }
+  .quiz-option.correct { border-color:var(--green); background:var(--green-bg); color:var(--green); }
+  .quiz-option.wrong { border-color:var(--coral); background:var(--coral-bg); color:var(--coral); }
+  .quiz-option.revealed { border-color:var(--green); background:var(--green-bg); color:var(--green); }
+  .review-card-outer { perspective:1000px; width:100%; max-width:480px; margin:0 auto; height:260px; cursor:pointer; }
+  .review-card-inner { position:relative; width:100%; height:100%; transform-style:preserve-3d; transition:transform 0.5s cubic-bezier(0.4,0,0.2,1); }
+  .review-card-inner.flipped { transform:rotateY(180deg); }
+  .review-face { position:absolute; inset:0; backface-visibility:hidden; background:var(--bg3); border:1px solid var(--border); border-radius:var(--radius-xl); display:flex; flex-direction:column; align-items:center; justify-content:center; padding:32px; gap:12px; }
+  .review-face-back { transform:rotateY(180deg); background:linear-gradient(135deg,rgba(124,111,239,0.08) 0%,rgba(78,205,196,0.08) 100%); }
+  .settings-group { margin-bottom:28px; }
+  .settings-label { font-size:13px; color:var(--text2); margin-bottom:8px; font-weight:500; }
+  .stat-card { background:var(--bg3); border:1px solid var(--border); border-radius:var(--radius-lg); padding:18px 20px; }
+  .stat-value { font-size:28px; font-weight:700; font-family:var(--font-mono); letter-spacing:-1px; }
+  .stat-label { font-size:12px; color:var(--text2); margin-top:4px; }
+  .modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:200; display:flex; align-items:center; justify-content:center; }
+  .modal { background:var(--bg2); border:1px solid var(--border); border-radius:var(--radius-xl); padding:28px; width:520px; max-width:92vw; box-shadow:var(--shadow-lg); }
+  .tab-bar { display:flex; gap:2px; background:var(--bg4); border-radius:10px; padding:4px; margin-bottom:20px; }
+  .tab-btn { flex:1; padding:8px; border-radius:8px; font-size:13px; font-weight:500; cursor:pointer; border:none; background:none; color:var(--text2); font-family:var(--font); transition:all 0.15s; }
+  .tab-btn.active { background:var(--bg2); color:var(--text); }
+  .empty-state { display:flex; flex-direction:column; align-items:center; justify-content:center; padding:60px 20px; text-align:center; gap:12px; }
+  .empty-state h3 { font-size:16px; font-weight:500; }
+  .empty-state p { font-size:13px; color:var(--text2); max-width:280px; line-height:1.6; }
+  .occurrence-item { padding:10px 14px; background:var(--bg4); border-radius:8px; margin-bottom:8px; cursor:pointer; transition:all 0.15s; }
+  .occurrence-item:hover { background:var(--bg3); border:1px solid var(--border2); }
+  .occurrence-source { font-size:11px; color:var(--text3); font-family:var(--font-mono); margin-bottom:4px; }
+  .processing-bar { height:3px; background:var(--bg4); border-radius:3px; overflow:hidden; margin-top:12px; }
+  .processing-fill { height:100%; background:linear-gradient(90deg,var(--accent),var(--teal)); border-radius:3px; animation:loading 1.5s ease-in-out infinite; }
+  @keyframes loading { 0%{width:0%;margin-left:0} 50%{width:60%;margin-left:20%} 100%{width:0%;margin-left:100%} }
+  .tag { padding:3px 10px; border-radius:20px; font-size:11px; background:var(--bg4); border:1px solid var(--border2); color:var(--text2); }
+  .toggle-track { width:36px; height:20px; background:var(--bg4); border:1px solid var(--border2); border-radius:20px; position:relative; transition:background 0.2s; cursor:pointer; }
+  .toggle-track.on { background:var(--accent); border-color:var(--accent); }
+  .toggle-thumb { position:absolute; width:14px; height:14px; background:white; border-radius:50%; top:2px; left:2px; transition:left 0.2s; }
+  .toggle-track.on .toggle-thumb { left:18px; }
+  .quiz-progress { display:flex; gap:6px; margin-bottom:28px; }
+  .quiz-dot { height:4px; flex:1; border-radius:4px; background:var(--bg4); transition:background 0.3s; }
+  .quiz-dot.done { background:var(--accent); }
+  .quiz-dot.current { background:var(--accent2); }
+  .result-circle { width:120px; height:120px; border-radius:50%; border:4px solid var(--accent); display:flex; flex-direction:column; align-items:center; justify-content:center; margin:0 auto 20px; }
+  .result-pct { font-size:32px; font-weight:700; font-family:var(--font-mono); }
+  .result-sub { font-size:12px; color:var(--text2); }
+  @keyframes fadeUp { from{transform:translateY(10px);opacity:0} to{transform:translateY(0);opacity:1} }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .spin { animation: spin 1s linear infinite; }
+  .api-key-input { font-family:var(--font-mono); font-size:13px; }
+  .error-box { background:var(--coral-bg); border:1px solid rgba(255,107,107,0.3); border-radius:var(--radius); padding:12px 16px; font-size:13px; color:var(--coral); display:flex; gap:10px; align-items:flex-start; margin-bottom:16px; }
+  .success-box { background:var(--green-bg); border:1px solid rgba(81,207,102,0.2); border-radius:var(--radius); padding:12px 16px; font-size:13px; color:var(--green); }
+  .rss-episode-list { max-height:340px; overflow-y:auto; border:1px solid var(--border); border-radius:var(--radius-lg); }
+  .rss-ep-item { display:flex; align-items:center; gap:12px; padding:12px 16px; border-bottom:1px solid var(--border); cursor:pointer; transition:background 0.1s; }
+  .rss-ep-item:last-child { border-bottom:none; }
+  .rss-ep-item:hover { background:var(--bg4); }
+  .rss-ep-item.selected { background:var(--accent-bg); }
+`;
+ 
+// ============================================================
+// HELPERS
+// ============================================================
+const fmtTime = (s) => { const m = Math.floor(s/60), sec = Math.floor(s%60); return `${m}:${sec.toString().padStart(2,"0")}`; };
+const genId = () => `${Date.now()}-${Math.random().toString(36).slice(2,7)}`;
+const QUIZ_TYPE_LABEL = { en_to_zh:"選擇題・英文選中文", zh_to_en:"選擇題・中文選英文", cloze:"克漏字・選出正確單字", pick_sentence:"選擇題・選出正確例句", fill:"填空題" };
+ 
+// ============================================================
+// WORD PANEL
+// ============================================================
+const WordPanel = ({ word, sentence, language, claudeKey, onClose, onAddToLibrary, episode }) => {
+  const [info, setInfo] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [added, setAdded] = useState(false);
+  const [moreExamples, setMoreExamples] = useState(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [synonyms, setSynonyms] = useState(null);
+  const [loadingSyn, setLoadingSyn] = useState(false);
+  const [conjugation, setConjugation] = useState(null);
+  const [loadingConj, setLoadingConj] = useState(false);
+ 
+  useEffect(() => {
+    if (!word) return;
+    setInfo(null); setError(""); setAdded(false); setMoreExamples(null); setSynonyms(null); setConjugation(null);
+    if (!claudeKey) { setError("請先在設定頁面輸入 Claude API Key"); return; }
+    setLoading(true);
+    lookupWord(word, sentence, language, claudeKey)
+      .then(setInfo).catch(e => setError(e.message)).finally(() => setLoading(false));
+  }, [word]);
+ 
+  const handleAdd = () => {
+    if (!info) return;
+    onAddToLibrary({
+      id: genId(), word: info.word, partOfSpeech: info.partOfSpeech, translation: info.translation,
+      pronunciation: info.pronunciation,
+      exampleOriginal: info.examples[0]?.original || sentence,
+      exampleTranslation: info.examples[0]?.translation || "",
+      language, tags: [], gender: info.gender || null,
+      source: { podcast: episode?.podcast || "", episode: episode?.title || "", time: fmtTime(0) },
+      proficiency: "unknown", occurrences: 1, pinned: false,
+      occurrenceRecords: [{ source: episode?.title || "", sentence, time: fmtTime(0) }],
+    });
+    setAdded(true);
+  };
+ 
+  const handleMoreExamples = async () => {
+    if (!info || !claudeKey) return;
+    setLoadingMore(true);
+    try { setMoreExamples(await generateMoreExamples(info.word, info.translation, language, claudeKey)); }
+    catch (e) { setError(e.message); } finally { setLoadingMore(false); }
+  };
+ 
+  const handleSynonyms = async () => {
+    if (!info || !claudeKey) return;
+    setLoadingSyn(true);
+    try { setSynonyms(await getSynonyms(info.word, claudeKey)); }
+    catch (e) { setError(e.message); } finally { setLoadingSyn(false); }
+  };
+ 
+  const handleConjugation = async () => {
+    if (!info || !claudeKey) return;
+    setLoadingConj(true);
+    try { setConjugation(await getFrConjugation(info.word, claudeKey)); }
+    catch (e) { setError(e.message); } finally { setLoadingConj(false); }
+  };
+ 
+  return (
+    <div className={`word-panel ${word ? "open" : ""}`}>
+      <div className="word-panel-header">
+        <div>
+          {loading ? <div style={{color:"var(--text2)",fontSize:14}}>查詢中…</div> :
+           info ? <>
+            <div className="word-main">{info.word}</div>
+            {info.pronunciation && <div className="word-pron">{info.pronunciation}</div>}
+            <div className="word-pos">{info.partOfSpeech}</div>
+            {info.gender && <span style={{fontSize:12,color:"var(--gold)",marginLeft:6}}>{info.gender}</span>}
+          </> : <div style={{fontSize:18,fontWeight:700}}>{word}</div>}
+        </div>
+        <button className="btn btn-ghost btn-icon" onClick={onClose}><Icon name="x" size={16}/></button>
+      </div>
+      <div className="word-panel-body">
+        {error && <div className="error-box"><Icon name="alertCircle" size={15}/>{error}</div>}
+        {info && <>
+          <div>
+            <div className="section-label">中文翻譯</div>
+            <div className="word-translation">{info.translation}</div>
+          </div>
+          <div>
+            <div className="section-label">例句</div>
+            {info.examples.map((ex,i) => (
+              <div key={i} className="example-card">
+                <div className="example-original">
+                  {ex.original.split(/\b/).map((w,j) =>
+                    w.toLowerCase() === info.word.toLowerCase()
+                      ? <span key={j} style={{color:"var(--accent2)",fontWeight:600}}>{w}</span>
+                      : <span key={j}>{w}</span>
+                  )}
+                </div>
+                <div className="example-translation">{ex.translation}</div>
+              </div>
+            ))}
+          </div>
+          {moreExamples && (
+            <div>
+              <div className="section-label">更多例句（AI 生成）</div>
+              {moreExamples.map((ex,i) => (
+                <div key={i} className="example-card">
+                  <div className="example-original">{ex.original}</div>
+                  <div className="example-translation">{ex.translation}</div>
+                </div>
+              ))}
+            </div>
+          )}
+          {synonyms && (
+            <div>
+              <div className="section-label">近義詞</div>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:8}}>{synonyms.synonyms.map(w => <span key={w} className="tag">{w}</span>)}</div>
+              <div className="section-label">反義詞</div>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>{synonyms.antonyms.map(w => <span key={w} className="tag" style={{borderColor:"rgba(255,107,107,0.3)",color:"var(--coral)"}}>{w}</span>)}</div>
+            </div>
+          )}
+          {conjugation && (
+            <div>
+              <div className="section-label">動詞變化</div>
+              {Object.entries(conjugation).map(([tense, forms]) => (
+                <div key={tense} style={{marginBottom:10}}>
+                  <div style={{fontSize:11,color:"var(--accent2)",marginBottom:4,textTransform:"uppercase",letterSpacing:0.8}}>{tense === "present" ? "現在式" : tense === "passe" ? "過去式" : "未來式"}</div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"4px 12px",fontSize:12.5}}>
+                    {Object.entries(forms).map(([pro,v]) => (
+                      <div key={pro}><span style={{color:"var(--text3)",minWidth:32,display:"inline-block"}}>{pro}</span> <span style={{fontFamily:"var(--font-mono)"}}>{v}</span></div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+            <button className="btn btn-ghost btn-sm" onClick={handleMoreExamples} disabled={loadingMore}>
+              {loadingMore ? <><Icon name="loader" size={12} className="spin"/>生成中…</> : "更多例句"}
+            </button>
+            <button className="btn btn-ghost btn-sm" onClick={handleSynonyms} disabled={loadingSyn}>
+              {loadingSyn ? "查詢中…" : "近反義詞"}
+            </button>
+            {language === "fr" && (
+              <button className="btn btn-ghost btn-sm" onClick={handleConjugation} disabled={loadingConj}>
+                {loadingConj ? "查詢中…" : "動詞變化"}
+              </button>
+            )}
+          </div>
+          <div style={{marginTop:"auto",paddingTop:16,borderTop:"1px solid var(--border)"}}>
+            <button className={`btn ${added?"btn-ghost":"btn-primary"}`} style={{width:"100%",justifyContent:"center"}} onClick={handleAdd} disabled={added}>
+              {added ? <><Icon name="check" size={15}/>已加入字卡庫</> : <><Icon name="plus" size={15}/>加入字卡庫</>}
+            </button>
+          </div>
+        </>}
+        {loading && <div style={{display:"flex",flexDirection:"column",gap:8}}>
+          {[80,60,90,50].map((w,i) => <div key={i} style={{height:16,borderRadius:8,background:"var(--bg4)",width:`${w}%`,animation:"loading 1.5s ease-in-out infinite"}}/>)}
+        </div>}
+      </div>
+    </div>
+  );
+};
+ 
+// ============================================================
+// FLASHCARD DETAIL MODAL
+// ============================================================
+const FlashcardModal = ({ card, onClose, onDelete, onTogglePin, onUpdateProf, claudeKey }) => {
+  const [moreEx, setMoreEx] = useState(null);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [synonyms, setSynonyms] = useState(null);
+ 
+  if (!card) return null;
+  const handleMoreEx = async () => {
+    setLoadingMore(true);
+    try { setMoreEx(await generateMoreExamples(card.word, card.translation, card.language, claudeKey)); }
+    catch {} finally { setLoadingMore(false); }
+  };
+  const handleSyn = async () => { try { setSynonyms(await getSynonyms(card.word, claudeKey)); } catch {} };
+ 
+  return (
+    <div className="modal-overlay" onClick={e => e.target===e.currentTarget && onClose()}>
+      <div className="modal" style={{width:560,maxHeight:"88vh",overflowY:"auto",animation:"fadeUp 0.2s ease"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:20}}>
+          <div>
+            <div style={{fontSize:28,fontWeight:700,letterSpacing:-0.5,display:"flex",alignItems:"center",gap:10}}>
+              {card.word}{card.occurrences >= 3 && <span style={{fontSize:18}}>🔥</span>}
+            </div>
+            <div style={{display:"flex",gap:8,alignItems:"center",marginTop:6,flexWrap:"wrap"}}>
+              <span style={{fontSize:12,color:"var(--text3)",background:"var(--bg4)",padding:"2px 8px",borderRadius:20}}>{card.partOfSpeech}</span>
+              <span className={`badge badge-${card.language}`}>{card.language==="en"?"英文":"法文"}</span>
+              {card.gender && <span style={{fontSize:12,color:"var(--gold)",background:"var(--gold-bg)",padding:"2px 8px",borderRadius:20}}>{card.gender}</span>}
+              <span className={`badge badge-${card.proficiency}`}>{card.proficiency==="unknown"?"不會":card.proficiency==="fuzzy"?"模糊":"熟練"}</span>
+            </div>
+          </div>
+          <button className="btn btn-ghost btn-icon" onClick={onClose}><Icon name="x" size={16}/></button>
+        </div>
+        <div style={{fontSize:22,fontFamily:"var(--font-zh)",color:"var(--gold)",marginBottom:16}}>{card.translation}</div>
+        <div style={{background:"var(--bg4)",borderRadius:10,padding:14,marginBottom:16}}>
+          <div style={{fontSize:13.5,lineHeight:1.7,marginBottom:8}}>{card.exampleOriginal}</div>
+          <div style={{fontSize:12.5,color:"var(--text2)",fontFamily:"var(--font-zh)"}}>{card.exampleTranslation}</div>
+        </div>
+        {card.tags.length > 0 && <div style={{display:"flex",gap:6,marginBottom:16,flexWrap:"wrap"}}>{card.tags.map(t=><span key={t} className="tag">{t}</span>)}</div>}
+        <div style={{fontSize:12,color:"var(--text3)",marginBottom:16}}>
+          來源：{card.source.podcast} · {card.source.episode}
+        </div>
+        {card.occurrenceRecords?.length > 0 && (
+          <div style={{marginBottom:16}}>
+            <div className="section-label" style={{marginBottom:8}}>出現紀錄（{card.occurrences} 次）</div>
+            {card.occurrenceRecords.map((rec,i) => (
+              <div key={i} className="occurrence-item">
+                <div className="occurrence-source">{rec.source} · {rec.time}</div>
+                <div style={{fontSize:13,lineHeight:1.5}}>{rec.sentence}</div>
+              </div>
+            ))}
+          </div>
+        )}
+        {moreEx && (
+          <div style={{marginBottom:16}}>
+            <div className="section-label" style={{marginBottom:8}}>更多例句（AI 生成）</div>
+            {moreEx.map((ex,i) => <div key={i} className="example-card" style={{marginBottom:8}}>
+              <div className="example-original">{ex.original}</div>
+              <div className="example-translation">{ex.translation}</div>
+            </div>)}
+          </div>
+        )}
+        {synonyms && (
+          <div style={{marginBottom:16}}>
+            <div className="section-label" style={{marginBottom:6}}>近義詞</div>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:8}}>{synonyms.synonyms.map(w=><span key={w} className="tag">{w}</span>)}</div>
+            <div className="section-label" style={{marginBottom:6}}>反義詞</div>
+            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>{synonyms.antonyms.map(w=><span key={w} className="tag" style={{color:"var(--coral)"}}>{w}</span>)}</div>
+          </div>
+        )}
+        <div style={{borderTop:"1px solid var(--border)",paddingTop:14,display:"flex",gap:8,flexWrap:"wrap"}}>
+          <button className="btn btn-ghost btn-sm" onClick={() => onUpdateProf(card.id,"unknown")} style={card.proficiency==="unknown"?{borderColor:"var(--coral)",color:"var(--coral)"}:{}}>不會</button>
+          <button className="btn btn-ghost btn-sm" onClick={() => onUpdateProf(card.id,"fuzzy")} style={card.proficiency==="fuzzy"?{borderColor:"var(--gold)",color:"var(--gold)"}:{}}>模糊</button>
+          <button className="btn btn-ghost btn-sm" onClick={() => onUpdateProf(card.id,"mastered")} style={card.proficiency==="mastered"?{borderColor:"var(--green)",color:"var(--green)"}:{}}>熟練</button>
+          <button className="btn btn-ghost btn-sm" onClick={() => onTogglePin(card.id)}>
+            {card.pinned ? <><Icon name="bookmarkFilled" size={13}/>取消置頂</> : <><Icon name="bookmark" size={13}/>置頂</>}
+          </button>
+          <button className="btn btn-ghost btn-sm" onClick={handleMoreEx} disabled={loadingMore}>{loadingMore?"生成中…":"更多例句"}</button>
+          <button className="btn btn-ghost btn-sm" onClick={handleSyn}>近反義詞</button>
+          <button className="btn btn-danger btn-sm" style={{marginLeft:"auto"}} onClick={()=>{onDelete(card.id);onClose();}}>
+            <Icon name="trash" size={13}/>刪除
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+ 
+// ============================================================
+// IMPORT MODAL
+// ============================================================
+const ImportModal = ({ onClose, onImport, openaiKey }) => {
+  const [tab, setTab] = useState("rss");
+  const [url, setUrl] = useState("");
+  const [lang, setLang] = useState("en");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [rssResult, setRssResult] = useState(null);
+  const [selectedEps, setSelectedEps] = useState([]);
+ 
+  const handleFetchRSS = async () => {
+    if (!url) return;
+    setLoading(true); setError(""); setRssResult(null);
+    try { setRssResult(await parseRSS(url)); }
+    catch (e) { setError(e.message); } finally { setLoading(false); }
+  };
+ 
+  const handleAddURL = () => {
+    if (!url) return;
+    onImport([{ id: genId(), title: url.split("/").pop() || "音訊連結", podcast: "自訂連結", date: new Date().toLocaleDateString("zh-TW"), duration: "", audioUrl: url, language: lang, hasTranscript: false, transcript: [] }]);
+    onClose();
+  };
+ 
+  const toggleEp = (ep) => setSelectedEps(s => s.find(e=>e.id===ep.id) ? s.filter(e=>e.id!==ep.id) : [...s, {...ep, language:lang}]);
+ 
+  const handleImportSelected = () => {
+    if (selectedEps.length===0) return;
+    onImport(selectedEps);
+    onClose();
+  };
+ 
+  return (
+    <div className="modal-overlay" onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div className="modal">
+        <div style={{fontWeight:600,fontSize:17,marginBottom:20}}>匯入 Podcast</div>
+        <div className="tab-bar">
+          {[["rss","RSS Feed"],["url","音訊連結（.mp3）"]].map(([k,v])=>(
+            <button key={k} className={`tab-btn ${tab===k?"active":""}`} onClick={()=>{setTab(k);setError("");setRssResult(null);setUrl("");}}>
+              {v}
+            </button>
+          ))}
+        </div>
+        {error && <div className="error-box"><Icon name="alertCircle" size={15}/>{error}</div>}
+ 
+        {tab==="rss" && <>
+          <div className="settings-label">RSS Feed 網址</div>
+          <div style={{display:"flex",gap:8,marginBottom:16}}>
+            <input className="input" placeholder="https://feeds.example.com/podcast.rss" value={url} onChange={e=>setUrl(e.target.value)} onKeyDown={e=>e.key==="Enter"&&handleFetchRSS()}/>
+            <button className="btn btn-primary" onClick={handleFetchRSS} disabled={loading||!url} style={{flexShrink:0}}>
+              {loading ? <><span className="spin" style={{display:"inline-block"}}><Icon name="loader" size={14}/></span>載入中</> : "載入"}
+            </button>
+          </div>
+          {rssResult && <>
+            <div style={{marginBottom:10}}>
+              <div style={{fontSize:14,fontWeight:600,marginBottom:4}}>{rssResult.podcastName}</div>
+              <div style={{fontSize:12,color:"var(--text2)"}}>{rssResult.episodes.length} 集，已選 {selectedEps.length} 集</div>
+            </div>
+            <div style={{marginBottom:12}}>
+              <div className="settings-label">語言</div>
+              <div style={{display:"flex",gap:8}}>
+                {[["en","英文"],["fr","法文"]].map(([k,v])=>(
+                  <button key={k} className={`btn btn-sm ${lang===k?"btn-primary":"btn-ghost"}`} onClick={()=>setLang(k)}>{v}</button>
+                ))}
+              </div>
+            </div>
+            <div className="rss-episode-list">
+              {rssResult.episodes.slice(0,30).map(ep=>(
+                <div key={ep.id} className={`rss-ep-item ${selectedEps.find(e=>e.id===ep.id)?"selected":""}`} onClick={()=>toggleEp(ep)}>
+                  <div style={{width:18,height:18,borderRadius:4,border:`2px solid ${selectedEps.find(e=>e.id===ep.id)?"var(--accent)":"var(--border2)"}`,background:selectedEps.find(e=>e.id===ep.id)?"var(--accent)":"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+                    {selectedEps.find(e=>e.id===ep.id) && <Icon name="check" size={11}/>}
+                  </div>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontSize:13,fontWeight:500,whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis"}}>{ep.title}</div>
+                    <div style={{fontSize:11,color:"var(--text3)"}}>{ep.date} {ep.duration && `· ${ep.duration}`}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <button className="btn btn-primary" style={{width:"100%",justifyContent:"center",marginTop:14}} onClick={handleImportSelected} disabled={selectedEps.length===0}>
+              匯入 {selectedEps.length} 集
+            </button>
+          </>}
+        </>}
+ 
+        {tab==="url" && <>
+          <div className="settings-label">音訊檔案連結（直接 .mp3 網址）</div>
+          <input className="input" placeholder="https://example.com/episode.mp3" value={url} onChange={e=>setUrl(e.target.value)} style={{marginBottom:12}}/>
+          <div className="settings-label">語言</div>
+          <div style={{display:"flex",gap:8,marginBottom:20}}>
+            {[["en","英文"],["fr","法文"]].map(([k,v])=>(
+              <button key={k} className={`btn btn-sm ${lang===k?"btn-primary":"btn-ghost"}`} onClick={()=>setLang(k)}>{v}</button>
+            ))}
+          </div>
+          <button className="btn btn-primary" style={{width:"100%",justifyContent:"center"}} onClick={handleAddURL} disabled={!url}>
+            加入播放清單
+          </button>
+        </>}
+ 
+        <button className="btn btn-ghost" style={{width:"100%",justifyContent:"center",marginTop:10}} onClick={onClose}>取消</button>
+      </div>
+    </div>
+  );
+};
+ 
+// ============================================================
+// PAGE: EPISODES
+// ============================================================
+const EpisodesPage = ({ episodes, onSelectEpisode, onImport, openaiKey }) => {
+  const [showImport, setShowImport] = useState(false);
+  const [search, setSearch] = useState("");
+  const filtered = episodes.filter(ep => ep.title.toLowerCase().includes(search.toLowerCase()) || ep.podcast.toLowerCase().includes(search.toLowerCase()));
+ 
+  return (
+    <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
+      <div className="topbar">
+        <h2>Podcast 集數</h2>
+        <button className="btn btn-primary" onClick={()=>setShowImport(true)}><Icon name="plus" size={15}/>匯入</button>
+      </div>
+      <div className="content">
+        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12,marginBottom:24}}>
+          {[[episodes.length,"集 Podcast"],[episodes.filter(e=>e.hasTranscript).length,"已有逐字稿"],[episodes.filter(e=>e.language==="fr").length,"法文集數"]].map(([v,l])=>(
+            <div key={l} className="stat-card"><div className="stat-value" style={{color:"var(--accent2)"}}>{v}</div><div className="stat-label">{l}</div></div>
+          ))}
+        </div>
+        <input className="input" placeholder="搜尋集數或 Podcast 名稱…" value={search} onChange={e=>setSearch(e.target.value)} style={{marginBottom:16}}/>
+        {filtered.length===0 ? (
+          <div className="empty-state">
+            <Icon name="mic" size={40}/>
+            <h3>還沒有 Podcast</h3>
+            <p>點擊右上角「匯入」，貼入 RSS Feed 網址或音訊連結開始學習</p>
+          </div>
+        ) : filtered.map(ep=>(
+          <div key={ep.id} className="episode-item" onClick={()=>onSelectEpisode(ep)}>
+            <div className="episode-thumb">{ep.language==="fr"?"🇫🇷":"🎙️"}</div>
+            <div className="episode-info">
+              <div className="episode-title">{ep.title}</div>
+              <div className="episode-meta">
+                <span>{ep.podcast}</span>
+                {ep.date && <><span>·</span><span>{ep.date}</span></>}
+                {ep.duration && <><span>·</span><span>{ep.duration}</span></>}
+                {ep.hasTranscript && <span style={{color:"var(--teal)",fontSize:11}}>● 逐字稿</span>}
+              </div>
+            </div>
+            <span className={`badge badge-${ep.language}`}>{ep.language==="en"?"EN":"FR"}</span>
+            <Icon name="chevronRight" size={16}/>
+          </div>
+        ))}
+      </div>
+      {showImport && <ImportModal onClose={()=>setShowImport(false)} onImport={eps=>{onImport(eps);setShowImport(false);}} openaiKey={openaiKey}/>}
+    </div>
+  );
+};
+ 
+// ============================================================
+// PAGE: PLAYER
+// ============================================================
+const PlayerPage = ({ episode, onUpdateEpisode, onAddCard, flashcards, claudeKey, openaiKey }) => {
+  const audioRef = useRef(null);
+  const [playing, setPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [speed, setSpeed] = useState(1);
+  const [currentSentence, setCurrentSentence] = useState(0);
+  const [selectedWord, setSelectedWord] = useState(null);
+  const [selectedSentence, setSelectedSentence] = useState("");
+  const [transcribing, setTranscribing] = useState(false);
+  const [transError, setTransError] = useState("");
+  const transcriptRef = useRef(null);
+  const speeds = [0.75, 1, 1.25, 1.5];
+  const ep = episode || { title:"尚未選擇集數", podcast:"", audioUrl:"", language:"en", hasTranscript:false, transcript:[] };
+ 
+  useEffect(() => {
+    if (!audioRef.current) return;
+    const a = audioRef.current;
+    const onTime = () => {
+      setCurrentTime(a.currentTime);
+      if (ep.transcript?.length) {
+        const idx = ep.transcript.findIndex((s,i) => {
+          const next = ep.transcript[i+1];
+          return a.currentTime >= s.start && (!next || a.currentTime < next.start);
+        });
+        if (idx !== -1) setCurrentSentence(idx);
+      }
+    };
+    const onDur = () => setDuration(a.duration || 0);
+    const onEnd = () => setPlaying(false);
+    a.addEventListener("timeupdate", onTime);
+    a.addEventListener("loadedmetadata", onDur);
+    a.addEventListener("ended", onEnd);
+    return () => { a.removeEventListener("timeupdate",onTime); a.removeEventListener("loadedmetadata",onDur); a.removeEventListener("ended",onEnd); };
+  }, [ep.audioUrl, ep.transcript]);
+ 
+  // Auto-scroll active sentence
+  useEffect(() => {
+    if (transcriptRef.current) {
+      const active = transcriptRef.current.querySelector(".transcript-sentence.active");
+      if (active) active.scrollIntoView({ behavior:"smooth", block:"nearest" });
+    }
+  }, [currentSentence]);
+ 
+  const togglePlay = () => {
+    if (!audioRef.current) return;
+    if (playing) audioRef.current.pause(); else audioRef.current.play();
+    setPlaying(!playing);
+  };
+  const seek = (e) => {
+    if (!audioRef.current || !duration) return;
+    const r = e.currentTarget.getBoundingClientRect();
+    const t = ((e.clientX-r.left)/r.width)*duration;
+    audioRef.current.currentTime = t; setCurrentTime(t);
+  };
+  const skip = (s) => { if (audioRef.current) audioRef.current.currentTime = Math.max(0,audioRef.current.currentTime+s); };
+  const nextSpeed = () => { const i=speeds.indexOf(speed); const ns=speeds[(i+1)%speeds.length]; setSpeed(ns); if(audioRef.current) audioRef.current.playbackRate=ns; };
+  const jumpTo = (s) => { if (audioRef.current) { audioRef.current.currentTime=s.start; if(!playing){audioRef.current.play();setPlaying(true);} } };
+  const handleWordClick = (word, sentence) => { const clean=word.replace(/[^a-zA-ZÀ-ÿ''\-]/g,""); if(clean.length>2){setSelectedWord(clean);setSelectedSentence(sentence);} };
+ 
+  const handleTranscribe = async () => {
+    if (!openaiKey) { setTransError("請先在設定頁面輸入 OpenAI API Key"); return; }
+    if (!ep.audioUrl) { setTransError("此集數沒有音訊連結"); return; }
+    setTranscribing(true); setTransError("");
+    try {
+      const segs = await transcribeAudio(ep.audioUrl, openaiKey, ep.language);
+      onUpdateEpisode({ ...ep, hasTranscript:true, transcript:segs });
+    } catch(e) { setTransError(e.message); } finally { setTranscribing(false); }
+  };
+ 
+  const handleAddCard = (info) => onAddCard(info, ep);
+ 
+  return (
+    <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
+      <div className="topbar">
+        <h2 style={{fontSize:14,fontWeight:600}}>{ep.title}</h2>
+        {ep.audioUrl && <span className={`badge badge-${ep.language}`}>{ep.language==="en"?"EN":"FR"}</span>}
+      </div>
+      {ep.audioUrl && <audio ref={audioRef} src={ep.audioUrl} preload="metadata" crossOrigin="anonymous"/>}
+      <div style={{flex:1,overflowY:"auto",padding:24}} ref={transcriptRef}>
+        {!ep.audioUrl ? (
+          <div className="empty-state"><Icon name="play" size={40}/><h3>請先選擇集數</h3><p>到「Podcast 集數」頁面選擇要播放的集數</p></div>
+        ) : !ep.hasTranscript ? (
+          <div className="empty-state">
+            <div style={{fontSize:48,marginBottom:8}}>🎤</div>
+            <h3>尚無逐字稿</h3>
+            <p>使用 OpenAI Whisper 自動生成，支援英文與法文辨識</p>
+            {transError && <div className="error-box" style={{textAlign:"left"}}><Icon name="alertCircle" size={15}/>{transError}</div>}
+            <button className="btn btn-primary" onClick={handleTranscribe} disabled={transcribing}>
+              {transcribing ? <><span style={{display:"inline-block",animation:"spin 1s linear infinite"}}><Icon name="loader" size={14}/></span>辨識中…（依音訊長度需數分鐘）</> : "生成逐字稿"}
+            </button>
+            {transcribing && <div className="processing-bar" style={{width:280}}><div className="processing-fill"/></div>}
+          </div>
+        ) : (
+          <div>
+            <div style={{fontSize:12,color:"var(--text3)",marginBottom:16}}>點擊單字查詢 · 點擊句子跳轉播放</div>
+            {ep.transcript.map((s,i) => (
+              <div key={s.id} className={`transcript-sentence ${currentSentence===i?"active":""}`} onClick={()=>jumpTo(s)}>
+                <div className="transcript-time">{fmtTime(s.start)}</div>
+                <div>{s.text.split(/(\s+)/).map((token,j) => token.trim()
+                  ? <span key={j} className="word-clickable" onClick={e=>{e.stopPropagation();handleWordClick(token,s.text);}}>{token}</span>
+                  : <span key={j}>{token}</span>
+                )}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+ 
+      {ep.audioUrl && (
+        <div className="player">
+          <div className="player-top">
+            <div style={{width:44,height:44,borderRadius:10,background:"linear-gradient(135deg,var(--accent),#4a3fa0)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,flexShrink:0}}>
+              {ep.language==="fr"?"🇫🇷":"🎙️"}
+            </div>
+            <div className="player-info">
+              <div className="player-title">{ep.title}</div>
+              <div className="player-sub">{ep.podcast}</div>
+            </div>
+            <div className="player-controls">
+              <button className="ctrl-btn" onClick={nextSpeed}><span className="speed-btn">{speed}x</span></button>
+              <button className="ctrl-btn" onClick={()=>skip(-15)}><Icon name="rewind" size={18}/></button>
+              <button className="play-btn" onClick={togglePlay}><Icon name={playing?"pause":"play"} size={18}/></button>
+              <button className="ctrl-btn" onClick={()=>skip(30)}><Icon name="skip" size={18}/></button>
+            </div>
+          </div>
+          <div className="progress-bar" onClick={seek}>
+            <div className="progress-fill" style={{width:`${duration?Math.min(100,(currentTime/duration)*100):0}%`}}/>
+          </div>
+          <div className="time-row"><span>{fmtTime(currentTime)}</span><span>{fmtTime(duration)}</span></div>
+        </div>
+      )}
+ 
+      <WordPanel
+        word={selectedWord} sentence={selectedSentence} language={ep.language}
+        claudeKey={claudeKey} onClose={()=>setSelectedWord(null)}
+        onAddToLibrary={handleAddCard} episode={ep}
+      />
+    </div>
+  );
+};
+ 
+// ============================================================
+// PAGE: LIBRARY
+// ============================================================
+const LibraryPage = ({ flashcards, onDelete, onTogglePin, onUpdateProf, claudeKey }) => {
+  const [filter, setFilter] = useState("all");
+  const [sort, setSort] = useState("default");
+  const [search, setSearch] = useState("");
+  const [selectedCard, setSelectedCard] = useState(null);
+  const filters = [["all","全部"],["en","英文"],["fr","法文"],["pinned","已置頂"],["unknown","未熟練"],["high","高頻 🔥"]];
+  const filtered = flashcards
+    .filter(c => filter==="all"||((filter==="en"||filter==="fr")?c.language===filter:filter==="pinned"?c.pinned:filter==="unknown"?c.proficiency==="unknown":c.occurrences>=3))
+    .filter(c => !search||c.word.toLowerCase().includes(search.toLowerCase())||c.translation.includes(search))
+    .sort((a,b) => sort==="occurrences"?b.occurrences-a.occurrences:b.pinned-a.pinned);
+ 
+  return (
+    <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
+      <div className="topbar"><h2>字卡庫</h2><span style={{fontSize:13,color:"var(--text2)"}}>{flashcards.length} 張字卡</span></div>
+      <div className="content">
+        <div style={{display:"flex",gap:10,marginBottom:16}}>
+          <input className="input" placeholder="搜尋單字或中文…" value={search} onChange={e=>setSearch(e.target.value)}/>
+          <select className="input" style={{width:"auto"}} onChange={e=>setSort(e.target.value)}>
+            <option value="default">預設排序</option><option value="occurrences">出現次數</option>
+          </select>
+        </div>
+        <div className="filter-bar">{filters.map(([k,v])=><button key={k} className={`filter-btn ${filter===k?"active":""}`} onClick={()=>setFilter(k)}>{v}</button>)}</div>
+        {filtered.length===0 ? (
+          <div className="empty-state"><Icon name="layers" size={40}/><h3>沒有字卡</h3><p>在播放器點擊單字並加入字卡庫</p></div>
+        ) : (
+          <div className="flashcard-grid">
+            {filtered.map(card=>(
+              <div key={card.id} className={`flashcard ${card.pinned?"pinned":""}`} onClick={()=>setSelectedCard(card)}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:10}}>
+                  <div><div className="flashcard-word">{card.word}</div><div className="flashcard-pos">{card.partOfSpeech}</div></div>
+                  <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:4}}>
+                    <span className={`badge badge-${card.language}`}>{card.language==="en"?"EN":"FR"}</span>
+                    <span className={`badge badge-${card.proficiency}`}>{card.proficiency==="unknown"?"不會":card.proficiency==="fuzzy"?"模糊":"熟練"}</span>
+                  </div>
+                </div>
+                <div className="flashcard-translation">{card.translation}</div>
+                <div className="flashcard-example">{card.exampleOriginal?.slice(0,80)}…</div>
+                <div className="flashcard-footer">
+                  {card.tags?.[0] && <span className="tag">{card.tags[0]}</span>}
+                  {card.occurrences>=3 && <span>🔥</span>}
+                  <span style={{fontSize:11,color:"var(--text3)",marginLeft:"auto",fontFamily:"var(--font-mono)"}}>{card.occurrences}×</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+      {selectedCard && <FlashcardModal card={selectedCard} onClose={()=>setSelectedCard(null)} onDelete={onDelete} onTogglePin={onTogglePin} onUpdateProf={(id,p)=>{onUpdateProf(id,p);setSelectedCard(c=>({...c,proficiency:p}));}} claudeKey={claudeKey}/>}
+    </div>
+  );
+};
+ 
+// ============================================================
+// PAGE: QUIZ
+// ============================================================
+const QuizPage = ({ flashcards, episodes, claudeKey }) => {
+  const [step, setStep] = useState("intro");
+  const [quiz, setQuiz] = useState([]);
+  const [qIdx, setQIdx] = useState(0);
+  const [selected, setSelected] = useState(null);
+  const [fillVal, setFillVal] = useState("");
+  const [showAnswer, setShowAnswer] = useState(false);
+  const [results, setResults] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+ 
+  const latestEp = episodes.find(e=>e.hasTranscript) || episodes[0];
+ 
+  const handleStart = async () => {
+    if (flashcards.length < 3) { setError("至少需要 3 張字卡才能生成測驗"); return; }
+    if (!claudeKey) { setError("請先在設定頁面輸入 Claude API Key"); return; }
+    setLoading(true); setError("");
+    try {
+      const q = await generateQuiz(flashcards, latestEp?.transcript||[], claudeKey);
+      setQuiz(q); setStep("quiz"); setQIdx(0); setResults([]); setSelected(null); setFillVal(""); setShowAnswer(false);
+    } catch(e) { setError("出題失敗："+e.message); } finally { setLoading(false); }
+  };
+ 
+  const q = quiz[qIdx];
+  const handleNext = (correct) => {
+    setResults(r=>[...r,{q,correct}]);
+    setSelected(null); setFillVal(""); setShowAnswer(false);
+    if (qIdx+1<quiz.length) setQIdx(qIdx+1); else setStep("result");
+  };
+  const checkFill = () => {
+    setShowAnswer(true);
+    setTimeout(()=>handleNext(fillVal.trim().toLowerCase()===q.answer.toLowerCase()),1600);
+  };
+  const score = results.filter(r=>r.correct).length;
+ 
+  if (step==="intro") return (
+    <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
+      <div className="topbar"><h2>測驗</h2></div>
+      <div className="content" style={{display:"flex",alignItems:"center",justifyContent:"center"}}>
+        <div className="quiz-card" style={{textAlign:"center"}}>
+          <div style={{fontSize:48,marginBottom:16}}>🧠</div>
+          <h3 style={{fontSize:22,marginBottom:12,fontWeight:700}}>AI 動態出題</h3>
+          <p style={{color:"var(--text2)",fontSize:14,lineHeight:1.7,marginBottom:24,fontFamily:"var(--font-zh)"}}>
+            Claude 會根據你的字卡庫（{flashcards.length} 張）與 Podcast 內容，每次自動生成不同的測驗題，涵蓋英翻中、中翻英、克漏字、選句、填空
+          </p>
+          {error && <div className="error-box" style={{textAlign:"left",marginBottom:16}}><Icon name="alertCircle" size={15}/>{error}</div>}
+          <button className="btn btn-primary" style={{width:"100%",justifyContent:"center",padding:"13px"}} onClick={handleStart} disabled={loading}>
+            {loading ? <><span style={{display:"inline-block",animation:"spin 1s linear infinite"}}><Icon name="loader" size={16}/></span>Claude 出題中…</> : "開始測驗"}
+          </button>
+          {flashcards.length<3 && <p style={{fontSize:12,color:"var(--text3)",marginTop:12,fontFamily:"var(--font-zh)"}}>請先收聽 Podcast 並加入至少 3 張字卡</p>}
+        </div>
+      </div>
+    </div>
+  );
+ 
+  if (step==="result") {
+    const pct = Math.round((score/quiz.length)*100);
+    return (
+      <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
+        <div className="topbar"><h2>測驗結果</h2></div>
+        <div className="content" style={{display:"flex",alignItems:"center",justifyContent:"center"}}>
+          <div className="quiz-card" style={{textAlign:"center"}}>
+            <div className="result-circle" style={{borderColor:pct>=70?"var(--green)":pct>=40?"var(--gold)":"var(--coral)"}}>
+              <div className="result-pct">{pct}%</div><div className="result-sub">答對率</div>
+            </div>
+            <h3 style={{fontSize:18,marginBottom:8}}>{pct>=70?"太棒了！":pct>=40?"繼續加油！":"需要多複習"}</h3>
+            <p style={{color:"var(--text2)",fontSize:14,marginBottom:24,fontFamily:"var(--font-zh)"}}>{quiz.length} 題中答對 {score} 題{pct<70&&"，建議多複習字卡"}</p>
+            <div style={{marginBottom:24,textAlign:"left"}}>
+              {results.map((r,i)=>(
+                <div key={i} style={{display:"flex",alignItems:"center",gap:10,padding:"8px 0",borderBottom:"1px solid var(--border)"}}>
+                  <span style={{color:r.correct?"var(--green)":"var(--coral)",flexShrink:0}}><Icon name={r.correct?"check":"x"} size={16}/></span>
+                  <span style={{fontSize:13,flex:1,fontFamily:"var(--font-zh)"}}>{r.q.word||r.q.chineseWord||r.q.chineseHint||r.q.answer}</span>
+                  {!r.correct && <span className="badge badge-unknown">標記未熟練</span>}
+                </div>
+              ))}
+            </div>
+            <button className="btn btn-primary" style={{width:"100%",justifyContent:"center"}} onClick={()=>setStep("intro")}>再測一次</button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+ 
+  return (
+    <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
+      <div className="topbar">
+        <h2>測驗 {qIdx+1} / {quiz.length}</h2>
+        <button className="btn btn-ghost btn-sm" onClick={()=>setStep("intro")}>結束</button>
+      </div>
+      <div className="content" style={{display:"flex",alignItems:"flex-start",justifyContent:"center",paddingTop:40}}>
+        <div className="quiz-card">
+          <div className="quiz-progress">{quiz.map((_,i)=><div key={i} className={`quiz-dot ${i<qIdx?"done":i===qIdx?"current":""}`}/>)}</div>
+          <div style={{fontSize:11,color:"var(--accent2)",marginBottom:16,fontWeight:600,letterSpacing:1,textTransform:"uppercase",background:"var(--accent-bg)",display:"inline-block",padding:"4px 12px",borderRadius:20}}>
+            {QUIZ_TYPE_LABEL[q?.type]||q?.type}
+          </div>
+ 
+          {q?.type==="en_to_zh" && <>
+            <div style={{background:"var(--bg4)",borderRadius:"var(--radius-lg)",padding:"20px 24px",marginBottom:24,textAlign:"center"}}>
+              <div style={{fontSize:30,fontWeight:700,letterSpacing:-0.5,marginBottom:6}}>{q.word}</div>
+              <div style={{fontSize:12,color:"var(--text3)",background:"var(--bg3)",display:"inline-block",padding:"2px 10px",borderRadius:20}}>{q.partOfSpeech}</div>
+            </div>
+            <div style={{fontSize:13,color:"var(--text3)",marginBottom:12,fontFamily:"var(--font-zh)"}}>這個單字的中文意思是？</div>
+            {q.options.map((opt,i)=>(
+              <div key={i} className={`quiz-option ${selected===i?(i===q.answer?"correct":"wrong"):showAnswer&&i===q.answer?"revealed":""}`}
+                style={{fontFamily:"var(--font-zh)"}}
+                onClick={()=>{if(selected!==null)return;setSelected(i);setShowAnswer(true);setTimeout(()=>handleNext(i===q.answer),1200);}}>
+                <span style={{color:"var(--text3)",fontFamily:"var(--font-mono)",marginRight:10}}>{String.fromCharCode(65+i)}.</span>{opt}
+              </div>
+            ))}
+          </>}
+ 
+          {q?.type==="zh_to_en" && <>
+            <div style={{background:"var(--bg4)",borderRadius:"var(--radius-lg)",padding:"20px 24px",marginBottom:24,textAlign:"center"}}>
+              <div style={{fontSize:26,fontWeight:700,fontFamily:"var(--font-zh)",color:"var(--gold)",marginBottom:6}}>{q.chineseWord}</div>
+              <div style={{fontSize:12,color:"var(--text3)",background:"var(--bg3)",display:"inline-block",padding:"2px 10px",borderRadius:20}}>{q.partOfSpeech}</div>
+            </div>
+            <div style={{fontSize:13,color:"var(--text3)",marginBottom:12}}>Which English word matches?</div>
+            {q.options.map((opt,i)=>(
+              <div key={i} className={`quiz-option ${selected===i?(i===q.answer?"correct":"wrong"):showAnswer&&i===q.answer?"revealed":""}`}
+                style={{fontFamily:"var(--font-mono)",fontSize:15}}
+                onClick={()=>{if(selected!==null)return;setSelected(i);setShowAnswer(true);setTimeout(()=>handleNext(i===q.answer),1200);}}>
+                <span style={{color:"var(--text3)",marginRight:10}}>{String.fromCharCode(65+i)}.</span>{opt}
+              </div>
+            ))}
+          </>}
+ 
+          {q?.type==="cloze" && <>
+            <div style={{background:"var(--bg4)",borderRadius:"var(--radius-lg)",padding:"18px 20px",marginBottom:8,lineHeight:2,fontSize:15}}>
+              {q.sentenceBefore}{" "}
+              <span style={{display:"inline-block",minWidth:80,borderBottom:"2px solid var(--accent)",textAlign:"center",color:showAnswer?(selected===q.answer?"var(--green)":"var(--coral)"):"var(--accent2)",fontWeight:700,padding:"0 8px",fontFamily:"var(--font-mono)"}}>
+                {showAnswer?q.options[selected??q.answer]:"?????"}
+              </span>
+              {" "}{q.sentenceAfter}
+            </div>
+            <div style={{fontSize:13,color:"var(--text3)",fontFamily:"var(--font-zh)",marginBottom:20,paddingLeft:4}}>{q.sentenceTranslation}</div>
+            {q.options.map((opt,i)=>(
+              <div key={i} className={`quiz-option ${selected===i?(i===q.answer?"correct":"wrong"):showAnswer&&i===q.answer?"revealed":""}`}
+                style={{fontFamily:"var(--font-mono)",fontSize:15}}
+                onClick={()=>{if(selected!==null)return;setSelected(i);setShowAnswer(true);setTimeout(()=>handleNext(i===q.answer),1200);}}>
+                <span style={{color:"var(--text3)",marginRight:10}}>{String.fromCharCode(65+i)}.</span>{opt}
+              </div>
+            ))}
+          </>}
+ 
+          {q?.type==="pick_sentence" && <>
+            <div style={{background:"var(--bg4)",borderRadius:"var(--radius-lg)",padding:"20px 24px",marginBottom:24,textAlign:"center"}}>
+              <div style={{fontSize:28,fontWeight:700,letterSpacing:-0.5,marginBottom:4}}>{q.word}</div>
+              <div style={{fontSize:14,color:"var(--gold)",fontFamily:"var(--font-zh)"}}>{q.translation}</div>
+            </div>
+            <div style={{fontSize:13,color:"var(--text3)",marginBottom:14,fontFamily:"var(--font-zh)"}}>哪個例句最符合此單字在 Podcast 中的用法？</div>
+            {q.options.map((opt,i)=>(
+              <div key={i} className={`quiz-option ${selected===i?(i===q.correctIdx?"correct":"wrong"):showAnswer&&i===q.correctIdx?"revealed":""}`}
+                style={{lineHeight:1.65,fontSize:13.5}}
+                onClick={()=>{if(selected!==null)return;setSelected(i);setShowAnswer(true);setTimeout(()=>handleNext(i===q.correctIdx),1200);}}>
+                <span style={{color:"var(--text3)",marginRight:10}}>{String.fromCharCode(65+i)}.</span>{opt}
+              </div>
+            ))}
+            {showAnswer&&q.note&&<div style={{marginTop:14,padding:"10px 14px",background:"var(--accent-bg)",border:"1px solid var(--accent-border)",borderRadius:"var(--radius)",fontSize:12,color:"var(--accent2)",fontFamily:"var(--font-zh)"}}>💡 {q.note}</div>}
+          </>}
+ 
+          {q?.type==="fill" && <>
+            <div style={{background:"var(--accent-bg)",border:"1px solid var(--accent-border)",borderRadius:"var(--radius)",padding:"14px 18px",marginBottom:20}}>
+              <div style={{fontSize:11,color:"var(--accent2)",fontWeight:600,letterSpacing:0.8,textTransform:"uppercase",marginBottom:6}}>中文意思</div>
+              <div style={{fontSize:18,fontFamily:"var(--font-zh)",fontWeight:600}}>{q.chineseHint}</div>
+              <div style={{fontSize:12,color:"var(--text3)",marginTop:4}}>{q.partOfSpeech}</div>
+            </div>
+            <div style={{background:"var(--bg4)",borderRadius:"var(--radius)",padding:"14px 18px",marginBottom:16,fontSize:14,lineHeight:1.8,color:"var(--text2)"}}>
+              <div style={{fontSize:11,color:"var(--text3)",marginBottom:6,fontWeight:600,letterSpacing:0.8,textTransform:"uppercase"}}>填入英文單字完成句子</div>
+              <div>{q.sentence}</div>
+              <div style={{fontSize:13,color:"var(--text3)",marginTop:8,fontFamily:"var(--font-zh)"}}>{q.sentenceTranslation}</div>
+            </div>
+            <input className="input" placeholder="輸入英文單字…" value={fillVal} onChange={e=>setFillVal(e.target.value)}
+              onKeyDown={e=>e.key==="Enter"&&fillVal&&!showAnswer&&checkFill()}
+              style={{textAlign:"center",fontSize:22,fontFamily:"var(--font-mono)",letterSpacing:1,color:showAnswer?(fillVal.trim().toLowerCase()===q.answer.toLowerCase()?"var(--green)":"var(--coral)"):"var(--text)"}}/>
+            {showAnswer && (
+              <div style={{textAlign:"center",marginTop:12}}>
+                {fillVal.trim().toLowerCase()===q.answer.toLowerCase()
+                  ? <div style={{color:"var(--green)",fontSize:15,fontWeight:600}}>✓ 正確！</div>
+                  : <div><div style={{color:"var(--coral)",fontSize:14,marginBottom:4}}>✗ 答錯了</div>
+                      <div style={{fontSize:14,color:"var(--text2)"}}>正確答案：<span style={{color:"var(--green)",fontWeight:700,fontFamily:"var(--font-mono)"}}>{q.answer}</span></div></div>}
+              </div>
+            )}
+            {!showAnswer && <button className="btn btn-primary" style={{width:"100%",justifyContent:"center",marginTop:16}} onClick={checkFill} disabled={!fillVal}>確認</button>}
+          </>}
+        </div>
+      </div>
+    </div>
+  );
+};
+ 
+// ============================================================
+// PAGE: REVIEW
+// ============================================================
+const ReviewPage = ({ flashcards, onUpdateProf }) => {
+  const sorted = [...flashcards].sort((a,b)=>{const o={unknown:0,fuzzy:1,mastered:2};return o[a.proficiency]-o[b.proficiency]||b.occurrences-a.occurrences;});
+  const [idx, setIdx] = useState(0);
+  const [flipped, setFlipped] = useState(false);
+  const [done, setDone] = useState(false);
+  const card = sorted[idx];
+ 
+  const next = (prof) => { if(card) onUpdateProf(card.id,prof); setFlipped(false); setTimeout(()=>{if(idx+1<sorted.length)setIdx(idx+1);else setDone(true);},300); };
+ 
+  if (sorted.length===0) return (
+    <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
+      <div className="topbar"><h2>複習模式</h2></div>
+      <div className="content"><div className="empty-state"><Icon name="repeat" size={40}/><h3>字卡庫是空的</h3><p>先收聽 Podcast 並加入字卡再來複習</p></div></div>
+    </div>
+  );
+ 
+  if (done) return (
+    <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
+      <div className="topbar"><h2>複習模式</h2></div>
+      <div className="content" style={{display:"flex",alignItems:"center",justifyContent:"center"}}>
+        <div style={{textAlign:"center"}}><div style={{fontSize:56,marginBottom:16}}>🎉</div><h3 style={{fontSize:22,marginBottom:8}}>複習完成！</h3>
+          <p style={{color:"var(--text2)",marginBottom:24,fontFamily:"var(--font-zh)"}}>已複習 {sorted.length} 張字卡</p>
+          <button className="btn btn-primary" onClick={()=>{setIdx(0);setFlipped(false);setDone(false);}}>再複習一次</button>
+        </div>
+      </div>
+    </div>
+  );
+ 
+  return (
+    <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
+      <div className="topbar"><h2>複習模式</h2><span style={{fontSize:13,color:"var(--text2)"}}>{idx+1} / {sorted.length}</span></div>
+      <div className="content" style={{display:"flex",flexDirection:"column",alignItems:"center",paddingTop:40}}>
+        <div style={{width:"100%",maxWidth:500}}>
+          <div style={{display:"flex",gap:6,marginBottom:24}}>
+            {sorted.map((_,i)=><div key={i} style={{height:4,flex:1,borderRadius:4,background:i<idx?"var(--accent)":i===idx?"var(--accent2)":"var(--bg4)",transition:"background 0.3s"}}/>)}
+          </div>
+          <div style={{display:"flex",gap:8,justifyContent:"center",marginBottom:16}}>
+            <span className={`badge badge-${card.language}`}>{card.language==="en"?"英文":"法文"}</span>
+            <span className={`badge badge-${card.proficiency}`}>{card.proficiency==="unknown"?"不會":card.proficiency==="fuzzy"?"模糊":"熟練"}</span>
+            {card.occurrences>=3&&<span style={{color:"var(--coral)"}}>🔥 高頻</span>}
+          </div>
+          <div className="review-card-outer" onClick={()=>setFlipped(f=>!f)}>
+            <div className={`review-card-inner ${flipped?"flipped":""}`}>
+              <div className="review-face">
+                <div style={{fontSize:36,fontWeight:700,letterSpacing:-1}}>{card.word}</div>
+                <div style={{fontSize:13,color:"var(--text3)"}}>{card.partOfSpeech}</div>
+                {card.pronunciation && <div style={{fontSize:13,color:"var(--teal)",fontFamily:"var(--font-mono)"}}>{card.pronunciation}</div>}
+                <div style={{fontSize:12,color:"var(--text3)",marginTop:8}}>點擊翻牌</div>
+              </div>
+              <div className="review-face review-face-back">
+                <div style={{fontSize:24,fontFamily:"var(--font-zh)",color:"var(--gold)",marginBottom:12}}>{card.translation}</div>
+                <div style={{fontSize:13,color:"var(--text2)",lineHeight:1.6,textAlign:"center"}}>{card.exampleOriginal}</div>
+                <div style={{fontSize:12,color:"var(--text3)",fontFamily:"var(--font-zh)",textAlign:"center",marginTop:8}}>{card.exampleTranslation}</div>
+              </div>
+            </div>
+          </div>
+          {flipped && (
+            <div style={{display:"flex",gap:10,justifyContent:"center",marginTop:24}}>
+              {[["unknown","不會","var(--coral)","rgba(255,107,107,0.1)","rgba(255,107,107,0.3)"],["fuzzy","模糊","var(--gold)","rgba(232,184,75,0.1)","rgba(232,184,75,0.3)"],["mastered","熟練","var(--green)","rgba(81,207,102,0.1)","rgba(81,207,102,0.2)"]].map(([p,l,c,bg,bc])=>(
+                <button key={p} onClick={()=>next(p)} style={{padding:"10px 24px",borderRadius:10,fontSize:14,fontWeight:500,cursor:"pointer",border:`1px solid ${bc}`,background:bg,color:c,fontFamily:"var(--font)"}}>
+                  {l}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+ 
+// ============================================================
+// PAGE: SETTINGS
+// ============================================================
+const SettingsPage = ({ settings, onSave }) => {
+  const [claudeKey, setClaudeKey] = useState(settings.claudeKey||"");
+  const [openaiKey, setOpenaiKey] = useState(settings.openaiKey||"");
+  const [showKeys, setShowKeys] = useState(false);
+  const [saved, setSaved] = useState(false);
+ 
+  const save = () => { onSave({claudeKey,openaiKey}); setSaved(true); setTimeout(()=>setSaved(false),2000); };
+ 
+  return (
+    <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
+      <div className="topbar"><h2>設定</h2></div>
+      <div className="content" style={{maxWidth:600}}>
+        <div className="card" style={{marginBottom:20}}>
+          <div style={{fontWeight:600,marginBottom:20,fontSize:15}}>🤖 API 金鑰</div>
+          <div className="settings-group">
+            <div className="settings-label">Claude API Key（單字查詢、例句生成、動態出題）</div>
+            <div style={{display:"flex",gap:8}}>
+              <input className="input api-key-input" type={showKeys?"text":"password"} placeholder="sk-ant-api03-…" value={claudeKey} onChange={e=>setClaudeKey(e.target.value)}/>
+              <button className="btn btn-ghost btn-icon" onClick={()=>setShowKeys(!showKeys)}><Icon name={showKeys?"eyeOff":"eye"} size={16}/></button>
+            </div>
+            <div style={{fontSize:11,color:"var(--text3)",marginTop:6}}>前往 <a href="https://console.anthropic.com" target="_blank" rel="noopener" style={{color:"var(--accent2)"}}>console.anthropic.com</a> 取得 Key</div>
+          </div>
+          <div className="settings-group">
+            <div className="settings-label">OpenAI API Key（Whisper 語音辨識）</div>
+            <div style={{display:"flex",gap:8}}>
+              <input className="input api-key-input" type={showKeys?"text":"password"} placeholder="sk-…" value={openaiKey} onChange={e=>setOpenaiKey(e.target.value)}/>
+            </div>
+            <div style={{fontSize:11,color:"var(--text3)",marginTop:6}}>前往 <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener" style={{color:"var(--accent2)"}}>platform.openai.com</a> 取得 Key｜Whisper 費率：每分鐘音訊約 $0.006 USD</div>
+          </div>
+          <div style={{fontSize:12,color:"var(--text3)",background:"var(--bg4)",padding:"10px 14px",borderRadius:"var(--radius)"}}>
+            🔒 所有 API Key 僅儲存於你的瀏覽器（localStorage），不會傳送到任何第三方伺服器
+          </div>
+        </div>
+ 
+        <div className="card" style={{marginBottom:20}}>
+          <div style={{fontWeight:600,marginBottom:16,fontSize:15}}>📱 使用說明</div>
+          {[["1. 匯入 Podcast","到「Podcast 集數」貼入 RSS Feed 網址或音訊 .mp3 連結"],["2. 生成逐字稿","選擇集數進入播放器，點擊「生成逐字稿」（需要 OpenAI Key）"],["3. 查詢單字","點擊逐字稿中任何單字，右側彈出 Claude 即時解釋"],["4. 加入字卡","點擊「加入字卡庫」，字卡永久保存在瀏覽器"],["5. 測驗/複習","到「測驗」讓 Claude 動態出題，或到「複習模式」翻牌練習"]].map(([t,d])=>(
+            <div key={t} style={{display:"flex",gap:12,marginBottom:14}}>
+              <div style={{fontSize:13,fontWeight:600,color:"var(--accent2)",minWidth:120,fontFamily:"var(--font-zh)"}}>{t}</div>
+              <div style={{fontSize:13,color:"var(--text2)",fontFamily:"var(--font-zh)",lineHeight:1.6}}>{d}</div>
+            </div>
+          ))}
+        </div>
+ 
+        <button className="btn btn-primary" style={{padding:"12px 32px"}} onClick={save}>
+          {saved ? <><Icon name="check" size={15}/>已儲存</> : "儲存設定"}
+        </button>
+      </div>
+    </div>
+  );
+};
+ 
+// ============================================================
+// APP ROOT
+// ============================================================
+export default function App() {
+  const [page, setPage] = useState("episodes");
+  const [episodes, setEpisodes] = useState(() => lsGet(LS_KEYS.episodes, []));
+  const [flashcards, setFlashcards] = useState(() => lsGet(LS_KEYS.cards, []));
+  const [settings, setSettings] = useState(() => lsGet(LS_KEYS.settings, { claudeKey:"", openaiKey:"" }));
+  const [currentEpisode, setCurrentEpisode] = useState(null);
+ 
+  useEffect(() => { lsSet(LS_KEYS.episodes, episodes); }, [episodes]);
+  useEffect(() => { lsSet(LS_KEYS.cards, flashcards); }, [flashcards]);
+  useEffect(() => { lsSet(LS_KEYS.settings, settings); }, [settings]);
+ 
+  const handleImport = (eps) => setEpisodes(e => [...eps.map(ep=>({...ep,language:ep.language||"en"})), ...e]);
+  const handleSelectEpisode = (ep) => { setCurrentEpisode(ep); setPage("player"); };
+  const handleUpdateEpisode = (ep) => {
+    setEpisodes(es => es.map(e => e.id===ep.id ? ep : e));
+    setCurrentEpisode(ep);
+  };
+ 
+  const handleAddCard = (cardInfo, episode) => {
+    setFlashcards(cards => {
+      const existing = cards.find(c => c.word.toLowerCase()===cardInfo.word.toLowerCase() && c.language===cardInfo.language);
+      if (existing) {
+        return cards.map(c => c.id===existing.id ? {
+          ...c, occurrences: c.occurrences+1,
+          occurrenceRecords: [...(c.occurrenceRecords||[]), { source: episode?.title||"", sentence: cardInfo.occurrenceRecords?.[0]?.sentence||"", time: cardInfo.occurrenceRecords?.[0]?.time||"" }]
+        } : c);
+      }
+      return [cardInfo, ...cards];
+    });
+  };
+ 
+  const handleDeleteCard = (id) => setFlashcards(c => c.filter(card => card.id!==id));
+  const handleTogglePin = (id) => setFlashcards(c => c.map(card => card.id===id ? {...card,pinned:!card.pinned} : card));
+  const handleUpdateProf = (id, prof) => setFlashcards(c => c.map(card => card.id===id ? {...card,proficiency:prof} : card));
+  const handleSaveSettings = (s) => setSettings(s);
+ 
+  const navItems = [
+    { id:"episodes", icon:"mic", label:"Podcast 集數" },
+    { id:"player", icon:"play", label:"播放器" },
+    { id:"library", icon:"layers", label:"字卡庫" },
+    { id:"review", icon:"repeat", label:"複習模式" },
+    { id:"quiz", icon:"brain", label:"測驗" },
+    { id:"settings", icon:"settings", label:"設定" },
+  ];
+ 
+  return (
+    <>
+      <style>{styles}</style>
+      <div className="app">
+        <div className="sidebar">
+          <div className="sidebar-logo">
+            <h1>Learn with<br/><span>Podcast</span></h1>
+            <p>Podcast 語言學習工具</p>
+          </div>
+          {navItems.map(item => (
+            <button key={item.id} className={`nav-item ${page===item.id?"active":""}`} onClick={()=>setPage(item.id)}>
+              <Icon name={item.icon} size={16}/>{item.label}
+              {item.id==="library" && flashcards.length>0 && <span style={{marginLeft:"auto",fontSize:11,background:"var(--accent-bg)",color:"var(--accent2)",padding:"1px 7px",borderRadius:20}}>{flashcards.length}</span>}
+            </button>
+          ))}
+          {!settings.claudeKey && (
+            <div style={{margin:"auto 12px 12px",padding:"10px 12px",background:"var(--gold-bg)",border:"1px solid rgba(232,184,75,0.2)",borderRadius:"var(--radius)",fontSize:11,color:"var(--gold)",lineHeight:1.5,fontFamily:"var(--font-zh)"}}>
+              ⚠️ 請先到設定輸入 API Key
+            </div>
+          )}
+        </div>
+        <div className="main">
+          {page==="episodes" && <EpisodesPage episodes={episodes} onSelectEpisode={handleSelectEpisode} onImport={handleImport} openaiKey={settings.openaiKey}/>}
+          {page==="player" && <PlayerPage episode={currentEpisode} onUpdateEpisode={handleUpdateEpisode} onAddCard={handleAddCard} flashcards={flashcards} claudeKey={settings.claudeKey} openaiKey={settings.openaiKey}/>}
+          {page==="library" && <LibraryPage flashcards={flashcards} onDelete={handleDeleteCard} onTogglePin={handleTogglePin} onUpdateProf={handleUpdateProf} claudeKey={settings.claudeKey}/>}
+          {page==="review" && <ReviewPage flashcards={flashcards} onUpdateProf={handleUpdateProf}/>}
+          {page==="quiz" && <QuizPage flashcards={flashcards} episodes={episodes} claudeKey={settings.claudeKey}/>}
+          {page==="settings" && <SettingsPage settings={settings} onSave={handleSaveSettings}/>}
+        </div>
+      </div>
+    </>
+  );
+}
+ 
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(App));
+  </script>
+</body>
 </html>
  
