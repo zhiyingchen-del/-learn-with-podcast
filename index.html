@@ -58,8 +58,24 @@ async function parseRSS(url) {
 }
 
 async function transcribeAudio(audioUrl, openaiKey, language, onProgress) {
-  const CHUNK_SIZE = 18 * 1024 * 1024; // 18MB per chunk
+  const CHUNK_SIZE = 18 * 1024 * 1024;
   const langCode = language === "fr" ? "fr" : "en";
+
+  // 從 MP3 前 10 個 bytes 偵測 bitrate
+  function detectBitrate(buffer) {
+    const bytes = new Uint8Array(buffer);
+    // 找 MP3 frame sync (0xFF 0xE0 以上)
+    for (let i = 0; i < Math.min(bytes.length - 3, 10000); i++) {
+      if (bytes[i] === 0xFF && (bytes[i+1] & 0xE0) === 0xE0) {
+        const bitrateIdx = (bytes[i+2] >> 4) & 0xF;
+        // MPEG1 Layer3 bitrate table (kbps)
+        const bitrateTable = [0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0];
+        const kbps = bitrateTable[bitrateIdx];
+        if (kbps > 0) return kbps * 1000 / 8; // bytes per second
+      }
+    }
+    return null;
+  }
 
   async function sendChunkToWhisper(blob, timeOffset) {
     const formData = new FormData();
@@ -78,7 +94,6 @@ async function transcribeAudio(audioUrl, openaiKey, language, onProgress) {
       throw new Error(err?.error?.message || "Whisper API 錯誤：" + res.status);
     }
     const data = await res.json();
-    // duration 是 Whisper 回報這段音訊的實際長度（秒）
     const chunkDuration = data.duration || 0;
     const segments = (data.segments || []).map(seg => ({
       start: seg.start + timeOffset,
@@ -88,9 +103,9 @@ async function transcribeAudio(audioUrl, openaiKey, language, onProgress) {
     return { segments, chunkDuration };
   }
 
-  // 取得檔案大小
+  // 取得檔案大小與前幾 bytes（用於偵測 bitrate）
   const headRes = await fetch("/api/proxy?url=" + encodeURIComponent(audioUrl), {
-    headers: { Range: "bytes=0-0" }
+    headers: { Range: "bytes=0-9999" }
   });
   let totalSize = 0;
   const contentRange = headRes.headers.get("content-range");
@@ -100,6 +115,10 @@ async function transcribeAudio(audioUrl, openaiKey, language, onProgress) {
     if (match) totalSize = parseInt(match[1]);
   }
   if (!totalSize && contentLength) totalSize = parseInt(contentLength);
+
+  // 偵測 bitrate
+  const headerBuffer = await headRes.arrayBuffer();
+  const bytesPerSec = detectBitrate(headerBuffer);
 
   let allSegments = [];
 
@@ -113,12 +132,12 @@ async function transcribeAudio(audioUrl, openaiKey, language, onProgress) {
     allSegments = segments;
   } else {
     const numChunks = Math.ceil(totalSize / CHUNK_SIZE);
-    // 用 Whisper 回報的實際時長累積，不靠估算
     let accumulatedTime = 0;
 
     for (let i = 0; i < numChunks; i++) {
       const start = i * CHUNK_SIZE;
       const end = Math.min((i + 1) * CHUNK_SIZE - 1, totalSize - 1);
+      const chunkBytes = end - start + 1;
       const pct = Math.round((i / numChunks) * 90);
       if (onProgress) onProgress("第 " + (i+1) + "/" + numChunks + " 段辨識中...", pct);
 
@@ -128,15 +147,17 @@ async function transcribeAudio(audioUrl, openaiKey, language, onProgress) {
       if (!chunkRes.ok) throw new Error("分段下載失敗（第 " + (i+1) + " 段）");
       const blob = await chunkRes.blob();
 
-      // 傳入累積的實際時長作為 offset，而非估算值
       const { segments, chunkDuration } = await sendChunkToWhisper(blob, accumulatedTime);
       allSegments.push(...segments);
 
-      // 用 Whisper 回報的實際時長累積，廣告時長也自動包含在內
       if (chunkDuration > 0) {
+        // 優先用 Whisper 回報的實際時長
         accumulatedTime += chunkDuration;
+      } else if (bytesPerSec) {
+        // 次選：用偵測到的 bitrate 精確計算
+        accumulatedTime += chunkBytes / bytesPerSec;
       } else if (segments.length > 0) {
-        // fallback：用最後一段的結束時間
+        // 最後手段：用最後一段的結束時間
         accumulatedTime = segments[segments.length - 1].end;
       }
     }
