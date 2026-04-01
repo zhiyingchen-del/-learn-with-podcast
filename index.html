@@ -13,19 +13,19 @@
   <div id="root"></div>
   <script type="text/babel" data-presets="react">
 const { useState, useRef, useEffect, useCallback } = React;
- 
+
 // ============================================================
 // STORAGE HELPERS (localStorage)
 // ============================================================
 const LS_KEYS = { cards: "lwp_flashcards", episodes: "lwp_episodes", settings: "lwp_settings" };
 const lsGet = (k, def) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : def; } catch { return def; } };
 const lsSet = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
- 
+
 // ============================================================
 // API HELPERS
 // ============================================================
 const CORS_PROXY = "/api/proxy?url=";
- 
+
 async function parseRSS(url) {
   const res = await fetch("/api/proxy?url=" + encodeURIComponent(url));
   if (!res.ok) throw new Error("無法取得 RSS Feed，請確認網址是否正確（" + res.status + "）");
@@ -54,40 +54,59 @@ async function parseRSS(url) {
     }).filter(ep => ep.audioUrl),
   };
 }
- 
+
 async function transcribeAudio(audioUrl, openaiKey, language) {
-  // Use our own Vercel proxy to download audio
-  const proxyUrl = "/api/proxy?type=audio&url=" + encodeURIComponent(audioUrl);
-  const audioRes = await fetch(proxyUrl);
-  if (!audioRes.ok) throw new Error("無法下載音訊檔案（" + audioRes.status + "）");
+  // Step 1: Download audio via our Vercel proxy (server-side, no CORS)
+  // Step 2: Send to Whisper API directly from browser
+  // For long audio: proxy downloads chunks, whisper handles it
+  
+  // First try: send URL to our proxy which will stream to Whisper
+  const whisperProxyUrl = "/api/whisper";
+  const proxyRes = await fetch(whisperProxyUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ audioUrl, openaiKey, language }),
+  });
+  
+  if (proxyRes.ok) {
+    const data = await proxyRes.json();
+    if (data.segments) {
+      return data.segments.map((seg, i) => ({
+        id: i, start: seg.start, end: seg.end, text: seg.text.trim(),
+      }));
+    }
+    if (data.error) throw new Error(data.error);
+  }
+  
+  // Fallback: download audio via proxy then send to Whisper directly
+  const audioProxyUrl = "/api/proxy?type=audio&url=" + encodeURIComponent(audioUrl);
+  const audioRes = await fetch(audioProxyUrl);
+  if (!audioRes.ok) throw new Error("無法下載音訊（" + audioRes.status + "），請確認音訊連結是否正確");
   const audioBlob = await audioRes.blob();
-  if (audioBlob.size < 1000) throw new Error("音訊檔案下載失敗，檔案過小");
- 
+  if (audioBlob.size < 1000) throw new Error("音訊檔案過小，下載可能失敗");
+
   const formData = new FormData();
   formData.append("file", audioBlob, "audio.mp3");
   formData.append("model", "whisper-1");
   formData.append("language", language === "fr" ? "fr" : "en");
   formData.append("response_format", "verbose_json");
   formData.append("timestamp_granularities[]", "segment");
- 
+
   const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
     method: "POST",
-    headers: { Authorization: `Bearer ${openaiKey}` },
+    headers: { Authorization: "Bearer " + openaiKey },
     body: formData,
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || `Whisper API 錯誤：${res.status}`);
+    throw new Error(err?.error?.message || "Whisper API 錯誤：" + res.status);
   }
   const data = await res.json();
   return (data.segments || []).map((seg, i) => ({
-    id: i,
-    start: seg.start,
-    end: seg.end,
-    text: seg.text.trim(),
+    id: i, start: seg.start, end: seg.end, text: seg.text.trim(),
   }));
 }
- 
+
 async function claudeCall(prompt, claudeKey, maxTokens = 1000) {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -110,7 +129,7 @@ async function claudeCall(prompt, claudeKey, maxTokens = 1000) {
   const data = await res.json();
   return data.content.map(b => b.text || "").join("").replace(/```json|```/g, "").trim();
 }
- 
+
 async function lookupWord(word, sentence, language, claudeKey) {
   const langName = language === "fr" ? "法文" : "英文";
   const frExtra = language === "fr" ? `,
@@ -124,38 +143,38 @@ async function lookupWord(word, sentence, language, claudeKey) {
   const text = await claudeCall(prompt, claudeKey, 1000);
   return JSON.parse(text);
 }
- 
+
 async function generateMoreExamples(word, translation, language, claudeKey) {
   const langName = language === "fr" ? "法文" : "英文";
   const prompt = `為「${word}」（中文：${translation}）生成3個生活化${langName}例句，場景多元。只回傳JSON陣列：[{"original":"例句","translation":"中文翻譯"},...]`;
   const text = await claudeCall(prompt, claudeKey, 600);
   return JSON.parse(text);
 }
- 
+
 async function getSynonyms(word, claudeKey) {
   const prompt = `為「${word}」列出近義詞和反義詞。只回傳JSON：{"synonyms":["詞1","詞2","詞3"],"antonyms":["詞1","詞2"]}`;
   const text = await claudeCall(prompt, claudeKey, 300);
   return JSON.parse(text);
 }
- 
+
 async function getFrConjugation(word, claudeKey) {
   const prompt = `請列出法文動詞「${word}」的完整變化表（現在式、過去式、未來式）。只回傳JSON：{"present":{"je":"","tu":"","il":"","nous":"","vous":"","ils":""},"passe":{"je":"","tu":"","il":"","nous":"","vous":"","ils":""},"futur":{"je":"","tu":"","il":"","nous":"","vous":"","ils":""}}`;
   const text = await claudeCall(prompt, claudeKey, 500);
   return JSON.parse(text);
 }
- 
+
 async function generateQuiz(flashcards, transcript, claudeKey) {
   const cards = flashcards.slice(0, 12).map(c =>
     `${c.word}(${c.partOfSpeech})=${c.translation}｜例：${c.exampleOriginal.slice(0, 80)}`
   ).join("\n");
   const transcriptText = transcript.map(s => s.text).join(" ").slice(0, 600);
   const prompt = `你是語言測驗出題老師，根據以下單字和文本生成6道測驗題，涵蓋5種題型（en_to_zh/zh_to_en/cloze/pick_sentence/fill各至少一題）。只回傳JSON陣列。
- 
+
 單字：
 ${cards}
- 
+
 文本：${transcriptText}
- 
+
 JSON格式（嚴格遵守）：
 [
   {"type":"en_to_zh","word":"單字","partOfSpeech":"n.","options":["正確中文","錯誤1","錯誤2","錯誤3"],"answer":0},
@@ -168,7 +187,7 @@ JSON格式（嚴格遵守）：
   const text = await claudeCall(prompt, claudeKey, 2000);
   return JSON.parse(text);
 }
- 
+
 // ============================================================
 // ICONS
 // ============================================================
@@ -207,7 +226,7 @@ const Icon = ({ name, size = 18 }) => {
     </svg>
   );
 };
- 
+
 // ============================================================
 // STYLES
 // ============================================================
@@ -374,14 +393,14 @@ const styles = `
   .rss-ep-item:hover { background:var(--bg4); }
   .rss-ep-item.selected { background:var(--accent-bg); }
 `;
- 
+
 // ============================================================
 // HELPERS
 // ============================================================
 const fmtTime = (s) => { const m = Math.floor(s/60), sec = Math.floor(s%60); return `${m}:${sec.toString().padStart(2,"0")}`; };
 const genId = () => `${Date.now()}-${Math.random().toString(36).slice(2,7)}`;
 const QUIZ_TYPE_LABEL = { en_to_zh:"選擇題・英文選中文", zh_to_en:"選擇題・中文選英文", cloze:"克漏字・選出正確單字", pick_sentence:"選擇題・選出正確例句", fill:"填空題" };
- 
+
 // ============================================================
 // WORD PANEL
 // ============================================================
@@ -396,7 +415,7 @@ const WordPanel = ({ word, sentence, language, claudeKey, onClose, onAddToLibrar
   const [loadingSyn, setLoadingSyn] = useState(false);
   const [conjugation, setConjugation] = useState(null);
   const [loadingConj, setLoadingConj] = useState(false);
- 
+
   useEffect(() => {
     if (!word) return;
     setInfo(null); setError(""); setAdded(false); setMoreExamples(null); setSynonyms(null); setConjugation(null);
@@ -405,7 +424,7 @@ const WordPanel = ({ word, sentence, language, claudeKey, onClose, onAddToLibrar
     lookupWord(word, sentence, language, claudeKey)
       .then(setInfo).catch(e => setError(e.message)).finally(() => setLoading(false));
   }, [word]);
- 
+
   const handleAdd = () => {
     if (!info) return;
     onAddToLibrary({
@@ -420,28 +439,28 @@ const WordPanel = ({ word, sentence, language, claudeKey, onClose, onAddToLibrar
     });
     setAdded(true);
   };
- 
+
   const handleMoreExamples = async () => {
     if (!info || !claudeKey) return;
     setLoadingMore(true);
     try { setMoreExamples(await generateMoreExamples(info.word, info.translation, language, claudeKey)); }
     catch (e) { setError(e.message); } finally { setLoadingMore(false); }
   };
- 
+
   const handleSynonyms = async () => {
     if (!info || !claudeKey) return;
     setLoadingSyn(true);
     try { setSynonyms(await getSynonyms(info.word, claudeKey)); }
     catch (e) { setError(e.message); } finally { setLoadingSyn(false); }
   };
- 
+
   const handleConjugation = async () => {
     if (!info || !claudeKey) return;
     setLoadingConj(true);
     try { setConjugation(await getFrConjugation(info.word, claudeKey)); }
     catch (e) { setError(e.message); } finally { setLoadingConj(false); }
   };
- 
+
   return (
     <div className={`word-panel ${word ? "open" : ""}`}>
       <div className="word-panel-header">
@@ -538,7 +557,7 @@ const WordPanel = ({ word, sentence, language, claudeKey, onClose, onAddToLibrar
     </div>
   );
 };
- 
+
 // ============================================================
 // FLASHCARD DETAIL MODAL
 // ============================================================
@@ -546,7 +565,7 @@ const FlashcardModal = ({ card, onClose, onDelete, onTogglePin, onUpdateProf, cl
   const [moreEx, setMoreEx] = useState(null);
   const [loadingMore, setLoadingMore] = useState(false);
   const [synonyms, setSynonyms] = useState(null);
- 
+
   if (!card) return null;
   const handleMoreEx = async () => {
     setLoadingMore(true);
@@ -554,7 +573,7 @@ const FlashcardModal = ({ card, onClose, onDelete, onTogglePin, onUpdateProf, cl
     catch {} finally { setLoadingMore(false); }
   };
   const handleSyn = async () => { try { setSynonyms(await getSynonyms(card.word, claudeKey)); } catch {} };
- 
+
   return (
     <div className="modal-overlay" onClick={e => e.target===e.currentTarget && onClose()}>
       <div className="modal" style={{width:560,maxHeight:"88vh",overflowY:"auto",animation:"fadeUp 0.2s ease"}}>
@@ -626,7 +645,7 @@ const FlashcardModal = ({ card, onClose, onDelete, onTogglePin, onUpdateProf, cl
     </div>
   );
 };
- 
+
 // ============================================================
 // IMPORT MODAL
 // ============================================================
@@ -639,28 +658,28 @@ const ImportModal = ({ onClose, onImport, openaiKey }) => {
   const [rssResult, setRssResult] = useState(null);
   const [selectedEps, setSelectedEps] = useState([]);
   const [epSearch, setEpSearch] = useState("");
- 
+
   const handleFetchRSS = async () => {
     if (!url) return;
     setLoading(true); setError(""); setRssResult(null);
     try { setRssResult(await parseRSS(url)); }
     catch (e) { setError(e.message); } finally { setLoading(false); }
   };
- 
+
   const handleAddURL = () => {
     if (!url) return;
     onImport([{ id: genId(), title: url.split("/").pop() || "音訊連結", podcast: "自訂連結", date: new Date().toLocaleDateString("zh-TW"), duration: "", audioUrl: url, language: lang, hasTranscript: false, transcript: [] }]);
     onClose();
   };
- 
+
   const toggleEp = (ep) => setSelectedEps(s => s.find(e=>e.id===ep.id) ? s.filter(e=>e.id!==ep.id) : [...s, {...ep, language:lang}]);
- 
+
   const handleImportSelected = () => {
     if (selectedEps.length===0) return;
     onImport(selectedEps);
     onClose();
   };
- 
+
   return (
     <div className="modal-overlay" onClick={e=>e.target===e.currentTarget&&onClose()}>
       <div className="modal">
@@ -673,7 +692,7 @@ const ImportModal = ({ onClose, onImport, openaiKey }) => {
           ))}
         </div>
         {error && <div className="error-box"><Icon name="alertCircle" size={15}/>{error}</div>}
- 
+
         {tab==="rss" && <>
           <div className="settings-label">RSS Feed 網址</div>
           <div style={{display:"flex",gap:8,marginBottom:16}}>
@@ -720,7 +739,7 @@ const ImportModal = ({ onClose, onImport, openaiKey }) => {
             </button>
           </>}
         </>}
- 
+
         {tab==="url" && <>
           <div className="settings-label">音訊檔案連結（直接 .mp3 網址）</div>
           <input className="input" placeholder="https://example.com/episode.mp3" value={url} onChange={e=>setUrl(e.target.value)} style={{marginBottom:12}}/>
@@ -734,13 +753,13 @@ const ImportModal = ({ onClose, onImport, openaiKey }) => {
             加入播放清單
           </button>
         </>}
- 
+
         <button className="btn btn-ghost" style={{width:"100%",justifyContent:"center",marginTop:10}} onClick={onClose}>取消</button>
       </div>
     </div>
   );
 };
- 
+
 // ============================================================
 // PAGE: EPISODES
 // ============================================================
@@ -748,7 +767,7 @@ const EpisodesPage = ({ episodes, onSelectEpisode, onImport, openaiKey }) => {
   const [showImport, setShowImport] = useState(false);
   const [search, setSearch] = useState("");
   const filtered = episodes.filter(ep => ep.title.toLowerCase().includes(search.toLowerCase()) || ep.podcast.toLowerCase().includes(search.toLowerCase()));
- 
+
   return (
     <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
       <div className="topbar">
@@ -789,7 +808,7 @@ const EpisodesPage = ({ episodes, onSelectEpisode, onImport, openaiKey }) => {
     </div>
   );
 };
- 
+
 // ============================================================
 // PAGE: PLAYER
 // ============================================================
@@ -807,7 +826,7 @@ const PlayerPage = ({ episode, onUpdateEpisode, onAddCard, flashcards, claudeKey
   const transcriptRef = useRef(null);
   const speeds = [0.75, 1, 1.25, 1.5];
   const ep = episode || { title:"尚未選擇集數", podcast:"", audioUrl:"", language:"en", hasTranscript:false, transcript:[] };
- 
+
   useEffect(() => {
     if (!audioRef.current) return;
     const a = audioRef.current;
@@ -828,7 +847,7 @@ const PlayerPage = ({ episode, onUpdateEpisode, onAddCard, flashcards, claudeKey
     a.addEventListener("ended", onEnd);
     return () => { a.removeEventListener("timeupdate",onTime); a.removeEventListener("loadedmetadata",onDur); a.removeEventListener("ended",onEnd); };
   }, [ep.audioUrl, ep.transcript]);
- 
+
   // Auto-scroll active sentence
   useEffect(() => {
     if (transcriptRef.current) {
@@ -836,7 +855,7 @@ const PlayerPage = ({ episode, onUpdateEpisode, onAddCard, flashcards, claudeKey
       if (active) active.scrollIntoView({ behavior:"smooth", block:"nearest" });
     }
   }, [currentSentence]);
- 
+
   const togglePlay = () => {
     if (!audioRef.current) return;
     if (playing) audioRef.current.pause(); else audioRef.current.play();
@@ -852,7 +871,7 @@ const PlayerPage = ({ episode, onUpdateEpisode, onAddCard, flashcards, claudeKey
   const nextSpeed = () => { const i=speeds.indexOf(speed); const ns=speeds[(i+1)%speeds.length]; setSpeed(ns); if(audioRef.current) audioRef.current.playbackRate=ns; };
   const jumpTo = (s) => { if (audioRef.current) { audioRef.current.currentTime=s.start; if(!playing){audioRef.current.play();setPlaying(true);} } };
   const handleWordClick = (word, sentence) => { const clean=word.replace(/[^a-zA-ZÀ-ÿ''\-]/g,""); if(clean.length>2){setSelectedWord(clean);setSelectedSentence(sentence);} };
- 
+
   const handleTranscribe = async () => {
     if (!openaiKey) { setTransError("請先在設定頁面輸入 OpenAI API Key"); return; }
     if (!ep.audioUrl) { setTransError("此集數沒有音訊連結"); return; }
@@ -862,9 +881,9 @@ const PlayerPage = ({ episode, onUpdateEpisode, onAddCard, flashcards, claudeKey
       onUpdateEpisode({ ...ep, hasTranscript:true, transcript:segs });
     } catch(e) { setTransError(e.message); } finally { setTranscribing(false); }
   };
- 
+
   const handleAddCard = (info) => onAddCard(info, ep);
- 
+
   return (
     <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
       <div className="topbar">
@@ -901,7 +920,7 @@ const PlayerPage = ({ episode, onUpdateEpisode, onAddCard, flashcards, claudeKey
           </div>
         )}
       </div>
- 
+
       {ep.audioUrl && (
         <div className="player">
           <div className="player-top">
@@ -925,7 +944,7 @@ const PlayerPage = ({ episode, onUpdateEpisode, onAddCard, flashcards, claudeKey
           <div className="time-row"><span>{fmtTime(currentTime)}</span><span>{fmtTime(duration)}</span></div>
         </div>
       )}
- 
+
       <WordPanel
         word={selectedWord} sentence={selectedSentence} language={ep.language}
         claudeKey={claudeKey} onClose={()=>setSelectedWord(null)}
@@ -934,7 +953,7 @@ const PlayerPage = ({ episode, onUpdateEpisode, onAddCard, flashcards, claudeKey
     </div>
   );
 };
- 
+
 // ============================================================
 // PAGE: LIBRARY
 // ============================================================
@@ -948,7 +967,7 @@ const LibraryPage = ({ flashcards, onDelete, onTogglePin, onUpdateProf, claudeKe
     .filter(c => filter==="all"||((filter==="en"||filter==="fr")?c.language===filter:filter==="pinned"?c.pinned:filter==="unknown"?c.proficiency==="unknown":c.occurrences>=3))
     .filter(c => !search||c.word.toLowerCase().includes(search.toLowerCase())||c.translation.includes(search))
     .sort((a,b) => sort==="occurrences"?b.occurrences-a.occurrences:b.pinned-a.pinned);
- 
+
   return (
     <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
       <div className="topbar"><h2>字卡庫</h2><span style={{fontSize:13,color:"var(--text2)"}}>{flashcards.length} 張字卡</span></div>
@@ -989,7 +1008,7 @@ const LibraryPage = ({ flashcards, onDelete, onTogglePin, onUpdateProf, claudeKe
     </div>
   );
 };
- 
+
 // ============================================================
 // PAGE: QUIZ
 // ============================================================
@@ -1003,9 +1022,9 @@ const QuizPage = ({ flashcards, episodes, claudeKey }) => {
   const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
- 
+
   const latestEp = episodes.find(e=>e.hasTranscript) || episodes[0];
- 
+
   const handleStart = async () => {
     if (flashcards.length < 3) { setError("至少需要 3 張字卡才能生成測驗"); return; }
     if (!claudeKey) { setError("請先在設定頁面輸入 Claude API Key"); return; }
@@ -1015,7 +1034,7 @@ const QuizPage = ({ flashcards, episodes, claudeKey }) => {
       setQuiz(q); setStep("quiz"); setQIdx(0); setResults([]); setSelected(null); setFillVal(""); setShowAnswer(false);
     } catch(e) { setError("出題失敗："+e.message); } finally { setLoading(false); }
   };
- 
+
   const q = quiz[qIdx];
   const handleNext = (correct) => {
     setResults(r=>[...r,{q,correct}]);
@@ -1027,7 +1046,7 @@ const QuizPage = ({ flashcards, episodes, claudeKey }) => {
     setTimeout(()=>handleNext(fillVal.trim().toLowerCase()===q.answer.toLowerCase()),1600);
   };
   const score = results.filter(r=>r.correct).length;
- 
+
   if (step==="intro") return (
     <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
       <div className="topbar"><h2>測驗</h2></div>
@@ -1047,7 +1066,7 @@ const QuizPage = ({ flashcards, episodes, claudeKey }) => {
       </div>
     </div>
   );
- 
+
   if (step==="result") {
     const pct = Math.round((score/quiz.length)*100);
     return (
@@ -1075,7 +1094,7 @@ const QuizPage = ({ flashcards, episodes, claudeKey }) => {
       </div>
     );
   }
- 
+
   return (
     <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
       <div className="topbar">
@@ -1088,7 +1107,7 @@ const QuizPage = ({ flashcards, episodes, claudeKey }) => {
           <div style={{fontSize:11,color:"var(--accent2)",marginBottom:16,fontWeight:600,letterSpacing:1,textTransform:"uppercase",background:"var(--accent-bg)",display:"inline-block",padding:"4px 12px",borderRadius:20}}>
             {QUIZ_TYPE_LABEL[q?.type]||q?.type}
           </div>
- 
+
           {q?.type==="en_to_zh" && <>
             <div style={{background:"var(--bg4)",borderRadius:"var(--radius-lg)",padding:"20px 24px",marginBottom:24,textAlign:"center"}}>
               <div style={{fontSize:30,fontWeight:700,letterSpacing:-0.5,marginBottom:6}}>{q.word}</div>
@@ -1103,7 +1122,7 @@ const QuizPage = ({ flashcards, episodes, claudeKey }) => {
               </div>
             ))}
           </>}
- 
+
           {q?.type==="zh_to_en" && <>
             <div style={{background:"var(--bg4)",borderRadius:"var(--radius-lg)",padding:"20px 24px",marginBottom:24,textAlign:"center"}}>
               <div style={{fontSize:26,fontWeight:700,fontFamily:"var(--font-zh)",color:"var(--gold)",marginBottom:6}}>{q.chineseWord}</div>
@@ -1118,7 +1137,7 @@ const QuizPage = ({ flashcards, episodes, claudeKey }) => {
               </div>
             ))}
           </>}
- 
+
           {q?.type==="cloze" && <>
             <div style={{background:"var(--bg4)",borderRadius:"var(--radius-lg)",padding:"18px 20px",marginBottom:8,lineHeight:2,fontSize:15}}>
               {q.sentenceBefore}{" "}
@@ -1136,7 +1155,7 @@ const QuizPage = ({ flashcards, episodes, claudeKey }) => {
               </div>
             ))}
           </>}
- 
+
           {q?.type==="pick_sentence" && <>
             <div style={{background:"var(--bg4)",borderRadius:"var(--radius-lg)",padding:"20px 24px",marginBottom:24,textAlign:"center"}}>
               <div style={{fontSize:28,fontWeight:700,letterSpacing:-0.5,marginBottom:4}}>{q.word}</div>
@@ -1152,7 +1171,7 @@ const QuizPage = ({ flashcards, episodes, claudeKey }) => {
             ))}
             {showAnswer&&q.note&&<div style={{marginTop:14,padding:"10px 14px",background:"var(--accent-bg)",border:"1px solid var(--accent-border)",borderRadius:"var(--radius)",fontSize:12,color:"var(--accent2)",fontFamily:"var(--font-zh)"}}>💡 {q.note}</div>}
           </>}
- 
+
           {q?.type==="fill" && <>
             <div style={{background:"var(--accent-bg)",border:"1px solid var(--accent-border)",borderRadius:"var(--radius)",padding:"14px 18px",marginBottom:20}}>
               <div style={{fontSize:11,color:"var(--accent2)",fontWeight:600,letterSpacing:0.8,textTransform:"uppercase",marginBottom:6}}>中文意思</div>
@@ -1182,7 +1201,7 @@ const QuizPage = ({ flashcards, episodes, claudeKey }) => {
     </div>
   );
 };
- 
+
 // ============================================================
 // PAGE: REVIEW
 // ============================================================
@@ -1192,16 +1211,16 @@ const ReviewPage = ({ flashcards, onUpdateProf }) => {
   const [flipped, setFlipped] = useState(false);
   const [done, setDone] = useState(false);
   const card = sorted[idx];
- 
+
   const next = (prof) => { if(card) onUpdateProf(card.id,prof); setFlipped(false); setTimeout(()=>{if(idx+1<sorted.length)setIdx(idx+1);else setDone(true);},300); };
- 
+
   if (sorted.length===0) return (
     <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
       <div className="topbar"><h2>複習模式</h2></div>
       <div className="content"><div className="empty-state"><Icon name="repeat" size={40}/><h3>字卡庫是空的</h3><p>先收聽 Podcast 並加入字卡再來複習</p></div></div>
     </div>
   );
- 
+
   if (done) return (
     <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
       <div className="topbar"><h2>複習模式</h2></div>
@@ -1213,7 +1232,7 @@ const ReviewPage = ({ flashcards, onUpdateProf }) => {
       </div>
     </div>
   );
- 
+
   return (
     <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
       <div className="topbar"><h2>複習模式</h2><span style={{fontSize:13,color:"var(--text2)"}}>{idx+1} / {sorted.length}</span></div>
@@ -1256,7 +1275,7 @@ const ReviewPage = ({ flashcards, onUpdateProf }) => {
     </div>
   );
 };
- 
+
 // ============================================================
 // PAGE: SETTINGS
 // ============================================================
@@ -1265,9 +1284,9 @@ const SettingsPage = ({ settings, onSave }) => {
   const [openaiKey, setOpenaiKey] = useState(settings.openaiKey||"");
   const [showKeys, setShowKeys] = useState(false);
   const [saved, setSaved] = useState(false);
- 
+
   const save = () => { onSave({claudeKey,openaiKey}); setSaved(true); setTimeout(()=>setSaved(false),2000); };
- 
+
   return (
     <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
       <div className="topbar"><h2>設定</h2></div>
@@ -1293,7 +1312,7 @@ const SettingsPage = ({ settings, onSave }) => {
             🔒 所有 API Key 僅儲存於你的瀏覽器（localStorage），不會傳送到任何第三方伺服器
           </div>
         </div>
- 
+
         <div className="card" style={{marginBottom:20}}>
           <div style={{fontWeight:600,marginBottom:16,fontSize:15}}>📱 使用說明</div>
           {[["1. 匯入 Podcast","到「Podcast 集數」貼入 RSS Feed 網址或音訊 .mp3 連結"],["2. 生成逐字稿","選擇集數進入播放器，點擊「生成逐字稿」（需要 OpenAI Key）"],["3. 查詢單字","點擊逐字稿中任何單字，右側彈出 Claude 即時解釋"],["4. 加入字卡","點擊「加入字卡庫」，字卡永久保存在瀏覽器"],["5. 測驗/複習","到「測驗」讓 Claude 動態出題，或到「複習模式」翻牌練習"]].map(([t,d])=>(
@@ -1303,7 +1322,7 @@ const SettingsPage = ({ settings, onSave }) => {
             </div>
           ))}
         </div>
- 
+
         <button className="btn btn-primary" style={{padding:"12px 32px"}} onClick={save}>
           {saved ? <><Icon name="check" size={15}/>已儲存</> : "儲存設定"}
         </button>
@@ -1311,7 +1330,7 @@ const SettingsPage = ({ settings, onSave }) => {
     </div>
   );
 };
- 
+
 // ============================================================
 // APP ROOT
 // ============================================================
@@ -1321,18 +1340,18 @@ function App() {
   const [flashcards, setFlashcards] = useState(() => lsGet(LS_KEYS.cards, []));
   const [settings, setSettings] = useState(() => lsGet(LS_KEYS.settings, { claudeKey:"", openaiKey:"" }));
   const [currentEpisode, setCurrentEpisode] = useState(null);
- 
+
   useEffect(() => { lsSet(LS_KEYS.episodes, episodes); }, [episodes]);
   useEffect(() => { lsSet(LS_KEYS.cards, flashcards); }, [flashcards]);
   useEffect(() => { lsSet(LS_KEYS.settings, settings); }, [settings]);
- 
+
   const handleImport = (eps) => setEpisodes(e => [...eps.map(ep=>({...ep,language:ep.language||"en"})), ...e]);
   const handleSelectEpisode = (ep) => { setCurrentEpisode(ep); setPage("player"); };
   const handleUpdateEpisode = (ep) => {
     setEpisodes(es => es.map(e => e.id===ep.id ? ep : e));
     setCurrentEpisode(ep);
   };
- 
+
   const handleAddCard = (cardInfo, episode) => {
     setFlashcards(cards => {
       const existing = cards.find(c => c.word.toLowerCase()===cardInfo.word.toLowerCase() && c.language===cardInfo.language);
@@ -1345,12 +1364,12 @@ function App() {
       return [cardInfo, ...cards];
     });
   };
- 
+
   const handleDeleteCard = (id) => setFlashcards(c => c.filter(card => card.id!==id));
   const handleTogglePin = (id) => setFlashcards(c => c.map(card => card.id===id ? {...card,pinned:!card.pinned} : card));
   const handleUpdateProf = (id, prof) => setFlashcards(c => c.map(card => card.id===id ? {...card,proficiency:prof} : card));
   const handleSaveSettings = (s) => setSettings(s);
- 
+
   const navItems = [
     { id:"episodes", icon:"mic", label:"Podcast 集數" },
     { id:"player", icon:"play", label:"播放器" },
@@ -1359,7 +1378,7 @@ function App() {
     { id:"quiz", icon:"brain", label:"測驗" },
     { id:"settings", icon:"settings", label:"設定" },
   ];
- 
+
   return (
     <>
       <style>{styles}</style>
@@ -1393,10 +1412,9 @@ function App() {
     </>
   );
 }
- 
+
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(React.createElement(App));
   </script>
 </body>
 </html>
- 
