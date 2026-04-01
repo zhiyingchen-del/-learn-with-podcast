@@ -1497,8 +1497,27 @@ const SettingsPage = ({ settings, onSave, onExport, onImportBackup }) => {
         </div>
 
         <div className="card" style={{marginBottom:20}}>
+          <div style={{fontWeight:600,marginBottom:16,fontSize:15}}>💾 資料備份與跨裝置同步</div>
+          <div style={{fontSize:13,color:"var(--text2)",fontFamily:"var(--font-zh)",marginBottom:16,lineHeight:1.7}}>
+            匯出備份檔案，在其他裝置（手機/電腦）匯入即可同步所有集數和字卡。
+          </div>
+          <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+            <button className="btn btn-ghost" onClick={onExport}>
+              ⬇ 匯出備份（JSON）
+            </button>
+            <label className="btn btn-ghost" style={{cursor:"pointer"}}>
+              ⬆ 匯入備份
+              <input type="file" accept=".json" style={{display:"none"}} onChange={e=>{ if(e.target.files[0]) onImportBackup(e.target.files[0]); e.target.value=""; }}/>
+            </label>
+          </div>
+          <div style={{fontSize:11,color:"var(--text3)",marginTop:10,fontFamily:"var(--font-zh)"}}>
+            ⚠️ 匯入會覆蓋目前裝置的所有資料，建議先匯出備份
+          </div>
+        </div>
+
+        <div className="card" style={{marginBottom:20}}>
           <div style={{fontWeight:600,marginBottom:16,fontSize:15}}>📱 使用說明</div>
-          {[["1. 匯入 Podcast","到「Podcast 集數」貼入 RSS Feed 網址或音訊 .mp3 連結"],["2. 生成逐字稿","選擇集數進入播放器，點擊「生成逐字稿」（需要 OpenAI Key）"],["3. 查詢單字","點擊逐字稿中任何單字，右側彈出 Claude 即時解釋"],["4. 加入字卡","點擊「加入字卡庫」，字卡永久保存在瀏覽器"],["5. 測驗/複習","到「測驗」讓 Claude 動態出題，或到「複習模式」翻牌練習"]].map(([t,d])=>(
+          {[["1. 匯入 Podcast","到「Podcast 集數」貼入 RSS Feed 網址或音訊 .mp3 連結"],["2. 生成逐字稿","選擇集數進入播放器，點擊「生成逐字稿」（需要 OpenAI Key）"],["3. 查詢單字","點擊逐字稿中任何單字，右側彈出 Claude 即時解釋"],["4. 加入字卡","點擊「加入字卡庫」，字卡永久保存在瀏覽器"],["5. 測驗/複習","到「測驗」讓 Claude 動態出題，或到「複習模式」翻牌練習"],["6. 時間偏移","播放器底部可微調逐字稿偏移，解決廣告造成的不同步"]].map(([t,d])=>(
             <div key={t} style={{display:"flex",gap:12,marginBottom:14}}>
               <div style={{fontSize:13,fontWeight:600,color:"var(--accent2)",minWidth:120,fontFamily:"var(--font-zh)"}}>{t}</div>
               <div style={{fontSize:13,color:"var(--text2)",fontFamily:"var(--font-zh)",lineHeight:1.6}}>{d}</div>
