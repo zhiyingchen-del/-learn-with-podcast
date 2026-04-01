@@ -24,11 +24,11 @@ const lsSet = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } ca
 // ============================================================
 // API HELPERS
 // ============================================================
-const CORS_PROXY = "https://corsproxy.io/?";
+const CORS_PROXY = "/api/proxy?url=";
  
 async function parseRSS(url) {
-  const res = await fetch(CORS_PROXY + encodeURIComponent(url));
-  if (!res.ok) throw new Error("無法取得 RSS Feed，請確認網址是否正確");
+  const res = await fetch("/api/proxy?url=" + encodeURIComponent(url));
+  if (!res.ok) throw new Error("無法取得 RSS Feed，請確認網址是否正確（" + res.status + "）");
   const text = await res.text();
   const parser = new DOMParser();
   const xml = parser.parseFromString(text, "text/xml");
@@ -56,11 +56,12 @@ async function parseRSS(url) {
 }
  
 async function transcribeAudio(audioUrl, openaiKey, language) {
-  // Fetch audio via proxy then send to Whisper
-  const proxyUrl = CORS_PROXY + encodeURIComponent(audioUrl);
+  // Use our own Vercel proxy to download audio
+  const proxyUrl = "/api/proxy?type=audio&url=" + encodeURIComponent(audioUrl);
   const audioRes = await fetch(proxyUrl);
-  if (!audioRes.ok) throw new Error("無法下載音訊檔案");
+  if (!audioRes.ok) throw new Error("無法下載音訊檔案（" + audioRes.status + "）");
   const audioBlob = await audioRes.blob();
+  if (audioBlob.size < 1000) throw new Error("音訊檔案下載失敗，檔案過小");
  
   const formData = new FormData();
   formData.append("file", audioBlob, "audio.mp3");
