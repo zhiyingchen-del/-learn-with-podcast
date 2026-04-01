@@ -890,7 +890,7 @@ const PlayerPage = ({ episode, onUpdateEpisode, onAddCard, flashcards, claudeKey
         <h2 style={{fontSize:14,fontWeight:600}}>{ep.title}</h2>
         {ep.audioUrl && <span className={`badge badge-${ep.language}`}>{ep.language==="en"?"EN":"FR"}</span>}
       </div>
-      {ep.audioUrl && <audio ref={audioRef} src={ep.audioUrl} preload="metadata" crossOrigin="anonymous"/>}
+      {ep.audioUrl && <audio ref={audioRef} src={"/api/proxy?type=audio&url=" + encodeURIComponent(ep.audioUrl)} preload="metadata"/>}
       <div style={{flex:1,overflowY:"auto",padding:24}} ref={transcriptRef}>
         {!ep.audioUrl ? (
           <div className="empty-state"><Icon name="play" size={40}/><h3>請先選擇集數</h3><p>到「Podcast 集數」頁面選擇要播放的集數</p></div>
