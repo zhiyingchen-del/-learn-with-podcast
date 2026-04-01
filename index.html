@@ -57,7 +57,7 @@ async function parseRSS(url) {
   };
 }
 
-async function transcribeAudio(audioUrl, openaiKey, language, onProgress) {
+async function transcribeAudio(audioUrl, openaiKey, language, onProgress, groqKey, provider) {
   const CHUNK_SIZE = 18 * 1024 * 1024;
   const langCode = language === "fr" ? "fr" : "en";
 
@@ -78,20 +78,27 @@ async function transcribeAudio(audioUrl, openaiKey, language, onProgress) {
   }
 
   async function sendChunkToWhisper(blob, timeOffset) {
+    const useGroq = provider === "groq" && groqKey;
+    const apiUrl = useGroq
+      ? "https://api.groq.com/openai/v1/audio/transcriptions"
+      : "https://api.openai.com/v1/audio/transcriptions";
+    const apiKey = useGroq ? groqKey : openaiKey;
+    const model = useGroq ? "whisper-large-v3-turbo" : "whisper-1";
+
     const formData = new FormData();
     formData.append("file", blob, "audio.mp3");
-    formData.append("model", "whisper-1");
+    formData.append("model", model);
     formData.append("language", langCode);
     formData.append("response_format", "verbose_json");
     formData.append("timestamp_granularities[]", "segment");
-    const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    const res = await fetch(apiUrl, {
       method: "POST",
-      headers: { Authorization: "Bearer " + openaiKey },
+      headers: { Authorization: "Bearer " + apiKey },
       body: formData,
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw new Error(err?.error?.message || "Whisper API 錯誤：" + res.status);
+      throw new Error(err?.error?.message || (useGroq ? "Groq" : "Whisper") + " API 錯誤：" + res.status);
     }
     const data = await res.json();
     const chunkDuration = data.duration || 0;
@@ -1050,7 +1057,7 @@ const PlayerPage = ({ episode, onUpdateEpisode, onAddCard, flashcards, claudeKey
     try {
       const segs = await transcribeAudio(ep.audioUrl, openaiKey, ep.language, (msg, pct) => {
         setTransMsg(msg + " (" + pct + "%)");
-      });
+      }, settings?.groqKey, settings?.whisperProvider);
       onUpdateEpisode({ ...ep, hasTranscript:true, transcript:segs });
     } catch(e) { setTransError(e.message); } finally { setTranscribing(false); }
   };
@@ -1465,10 +1472,12 @@ const ReviewPage = ({ flashcards, onUpdateProf }) => {
 const SettingsPage = ({ settings, onSave, onExport, onImportBackup }) => {
   const [claudeKey, setClaudeKey] = useState(settings.claudeKey||"");
   const [openaiKey, setOpenaiKey] = useState(settings.openaiKey||"");
+  const [groqKey, setGroqKey] = useState(settings.groqKey||"");
+  const [whisperProvider, setWhisperProvider] = useState(settings.whisperProvider||"groq");
   const [showKeys, setShowKeys] = useState(false);
   const [saved, setSaved] = useState(false);
 
-  const save = () => { onSave({claudeKey,openaiKey}); setSaved(true); setTimeout(()=>setSaved(false),2000); };
+  const save = () => { onSave({claudeKey, openaiKey, groqKey, whisperProvider}); setSaved(true); setTimeout(()=>setSaved(false),2000); };
 
   return (
     <div style={{display:"flex",flexDirection:"column",height:"100%"}}>
@@ -1484,12 +1493,27 @@ const SettingsPage = ({ settings, onSave, onExport, onImportBackup }) => {
             </div>
             <div style={{fontSize:11,color:"var(--text3)",marginTop:6}}>前往 <a href="https://console.anthropic.com" target="_blank" rel="noopener" style={{color:"var(--accent2)"}}>console.anthropic.com</a> 取得 Key</div>
           </div>
+
           <div className="settings-group">
-            <div className="settings-label">OpenAI API Key（Whisper 語音辨識）</div>
-            <div style={{display:"flex",gap:8}}>
-              <input className="input api-key-input" type={showKeys?"text":"password"} placeholder="sk-…" value={openaiKey} onChange={e=>setOpenaiKey(e.target.value)}/>
+            <div className="settings-label">語音辨識服務</div>
+            <div style={{display:"flex",gap:8,marginBottom:8}}>
+              {[["groq","Groq（免費、快速）"],["openai","OpenAI（收費、穩定）"]].map(([k,v])=>(
+                <button key={k} className={`btn btn-sm ${whisperProvider===k?"btn-primary":"btn-ghost"}`} onClick={()=>setWhisperProvider(k)}>{v}</button>
+              ))}
             </div>
-            <div style={{fontSize:11,color:"var(--text3)",marginTop:6}}>前往 <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener" style={{color:"var(--accent2)"}}>platform.openai.com</a> 取得 Key｜Whisper 費率：每分鐘音訊約 $0.006 USD</div>
+            {whisperProvider==="groq" ? (
+              <div>
+                <input className="input api-key-input" type={showKeys?"text":"password"} placeholder="gsk_..." value={groqKey} onChange={e=>setGroqKey(e.target.value)}/>
+                <div style={{fontSize:11,color:"var(--text3)",marginTop:6}}>
+                  前往 <a href="https://console.groq.com" target="_blank" rel="noopener" style={{color:"var(--accent2)"}}>console.groq.com</a> 免費申請 Key｜完全免費，速度比 OpenAI 快 3-5 倍
+                </div>
+              </div>
+            ) : (
+              <div>
+                <input className="input api-key-input" type={showKeys?"text":"password"} placeholder="sk-..." value={openaiKey} onChange={e=>setOpenaiKey(e.target.value)}/>
+                <div style={{fontSize:11,color:"var(--text3)",marginTop:6}}>費率：每分鐘音訊約 $0.006 USD</div>
+              </div>
+            )}
           </div>
           <div style={{fontSize:12,color:"var(--text3)",background:"var(--bg4)",padding:"10px 14px",borderRadius:"var(--radius)"}}>
             🔒 所有 API Key 僅儲存於你的瀏覽器（localStorage），不會傳送到任何第三方伺服器
@@ -1540,7 +1564,7 @@ function App() {
   const [page, setPage] = useState("episodes");
   const [episodes, setEpisodes] = useState(() => lsGet(LS_KEYS.episodes, []));
   const [flashcards, setFlashcards] = useState(() => lsGet(LS_KEYS.cards, []));
-  const [settings, setSettings] = useState(() => lsGet(LS_KEYS.settings, { claudeKey:"", openaiKey:"" }));
+  const [settings, setSettings] = useState(() => lsGet(LS_KEYS.settings, { claudeKey:"", openaiKey:"", groqKey:"", whisperProvider:"groq" }));
   const [currentEpisode, setCurrentEpisode] = useState(null);
 
   useEffect(() => { lsSet(LS_KEYS.episodes, episodes); }, [episodes]);
