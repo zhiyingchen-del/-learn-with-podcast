@@ -992,6 +992,7 @@ const PlayerPage = ({ episode, onUpdateEpisode, onAddCard, flashcards, claudeKey
   const [transcribing, setTranscribing] = useState(false);
   const [transError, setTransError] = useState("");
   const [transMsg, setTransMsg] = useState("");
+  const [offset, setOffset] = useState(0); // 逐字稿時間偏移（秒）
   const transcriptRef = useRef(null);
   const speeds = [0.75, 1, 1.25, 1.5];
   const ep = episode || { title:"尚未選擇集數", podcast:"", audioUrl:"", language:"en", hasTranscript:false, transcript:[] };
@@ -1002,9 +1003,10 @@ const PlayerPage = ({ episode, onUpdateEpisode, onAddCard, flashcards, claudeKey
     const onTime = () => {
       setCurrentTime(a.currentTime);
       if (ep.transcript?.length) {
+        const adjusted = a.currentTime - offset;
         const idx = ep.transcript.findIndex((s,i) => {
           const next = ep.transcript[i+1];
-          return a.currentTime >= s.start && (!next || a.currentTime < next.start);
+          return adjusted >= s.start && (!next || adjusted < next.start);
         });
         if (idx !== -1) setCurrentSentence(idx);
       }
@@ -1015,7 +1017,7 @@ const PlayerPage = ({ episode, onUpdateEpisode, onAddCard, flashcards, claudeKey
     a.addEventListener("loadedmetadata", onDur);
     a.addEventListener("ended", onEnd);
     return () => { a.removeEventListener("timeupdate",onTime); a.removeEventListener("loadedmetadata",onDur); a.removeEventListener("ended",onEnd); };
-  }, [ep.audioUrl, ep.transcript]);
+  }, [ep.audioUrl, ep.transcript, offset]);
 
   // Auto-scroll active sentence
   useEffect(() => {
@@ -1038,7 +1040,7 @@ const PlayerPage = ({ episode, onUpdateEpisode, onAddCard, flashcards, claudeKey
   };
   const skip = (s) => { if (audioRef.current) audioRef.current.currentTime = Math.max(0,audioRef.current.currentTime+s); };
   const nextSpeed = () => { const i=speeds.indexOf(speed); const ns=speeds[(i+1)%speeds.length]; setSpeed(ns); if(audioRef.current) audioRef.current.playbackRate=ns; };
-  const jumpTo = (s) => { if (audioRef.current) { audioRef.current.currentTime=s.start; if(!playing){audioRef.current.play();setPlaying(true);} } };
+  const jumpTo = (s) => { if (audioRef.current) { audioRef.current.currentTime=s.start + offset; if(!playing){audioRef.current.play();setPlaying(true);} } };
   const handleWordClick = (word, sentence) => { const clean=word.replace(/[^a-zA-ZÀ-ÿ''\-]/g,""); if(clean.length>2){setSelectedWord(clean);setSelectedSentence(sentence);} };
 
   const handleTranscribe = async () => {
@@ -1113,6 +1115,16 @@ const PlayerPage = ({ episode, onUpdateEpisode, onAddCard, flashcards, claudeKey
             <div className="progress-fill" style={{width:`${duration?Math.min(100,(currentTime/duration)*100):0}%`}}/>
           </div>
           <div className="time-row"><span>{fmtTime(currentTime)}</span><span>{fmtTime(duration)}</span></div>
+          {ep.hasTranscript && (
+            <div style={{display:"flex",alignItems:"center",gap:8,marginTop:8,flexWrap:"wrap"}}>
+              <span style={{fontSize:11,color:"var(--text3)"}}>逐字稿偏移</span>
+              <button className="ctrl-btn" style={{fontSize:13,padding:"3px 8px",border:"1px solid var(--border2)",borderRadius:6}} onClick={()=>setOffset(o=>o-1)}>−1s</button>
+              <span style={{fontSize:12,fontFamily:"var(--font-mono)",color:offset!==0?"var(--accent2)":"var(--text3)",minWidth:36,textAlign:"center"}}>{offset>0?"+":""}{offset}s</span>
+              <button className="ctrl-btn" style={{fontSize:13,padding:"3px 8px",border:"1px solid var(--border2)",borderRadius:6}} onClick={()=>setOffset(o=>o+1)}>+1s</button>
+              {offset!==0 && <button className="ctrl-btn" style={{fontSize:11,color:"var(--text3)"}} onClick={()=>setOffset(0)}>重置</button>}
+              <span style={{fontSize:11,color:"var(--text3)",marginLeft:4}}>廣告造成延遲可調整</span>
+            </div>
+          )}
         </div>
       )}
 
@@ -1450,7 +1462,7 @@ const ReviewPage = ({ flashcards, onUpdateProf }) => {
 // ============================================================
 // PAGE: SETTINGS
 // ============================================================
-const SettingsPage = ({ settings, onSave }) => {
+const SettingsPage = ({ settings, onSave, onExport, onImportBackup }) => {
   const [claudeKey, setClaudeKey] = useState(settings.claudeKey||"");
   const [openaiKey, setOpenaiKey] = useState(settings.openaiKey||"");
   const [showKeys, setShowKeys] = useState(false);
@@ -1516,8 +1528,13 @@ function App() {
   useEffect(() => { lsSet(LS_KEYS.cards, flashcards); }, [flashcards]);
   useEffect(() => { lsSet(LS_KEYS.settings, settings); }, [settings]);
 
-  const handleImport = (eps) => setEpisodes(e => [...eps.map(ep=>({...ep,language:ep.language||"en"})), ...e]);
+  const handleImport = (eps) => {
+    const newEps = eps.map(ep => ({ ...ep, language: ep.language||"en" }));
+    setEpisodes(e => [...newEps, ...e]);
+  };
+
   const handleSelectEpisode = (ep) => { setCurrentEpisode(ep); setPage("player"); };
+
   const handleUpdateEpisode = (ep) => {
     setEpisodes(es => es.map(e => e.id===ep.id ? ep : e));
     setCurrentEpisode(ep);
@@ -1529,7 +1546,9 @@ function App() {
       if (existing) {
         return cards.map(c => c.id===existing.id ? {
           ...c, occurrences: c.occurrences+1,
-          occurrenceRecords: [...(c.occurrenceRecords||[]), { source: episode?.title||"", sentence: cardInfo.occurrenceRecords?.[0]?.sentence||"", time: cardInfo.occurrenceRecords?.[0]?.time||"" }]
+          occurrenceRecords: [...(c.occurrenceRecords||[]), {
+            source: episode?.title||"", sentence: cardInfo.occurrenceRecords?.[0]?.sentence||"", time: cardInfo.occurrenceRecords?.[0]?.time||""
+          }]
         } : c);
       }
       return [cardInfo, ...cards];
@@ -1540,6 +1559,32 @@ function App() {
   const handleTogglePin = (id) => setFlashcards(c => c.map(card => card.id===id ? {...card,pinned:!card.pinned} : card));
   const handleUpdateProf = (id, prof) => setFlashcards(c => c.map(card => card.id===id ? {...card,proficiency:prof} : card));
   const handleSaveSettings = (s) => setSettings(s);
+
+  // 匯出所有資料
+  const handleExport = () => {
+    const data = { episodes, flashcards, exportedAt: new Date().toISOString(), version: 1 };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "learn-with-podcast-backup-" + new Date().toLocaleDateString("zh-TW").replace(/\//g,"-") + ".json";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // 匯入備份資料
+  const handleImportBackup = (file) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = JSON.parse(e.target.result);
+        if (data.episodes) setEpisodes(data.episodes);
+        if (data.flashcards) setFlashcards(data.flashcards);
+        alert("匯入成功！已載入 " + (data.episodes?.length||0) + " 集、" + (data.flashcards?.length||0) + " 張字卡");
+      } catch { alert("匯入失敗，請確認檔案格式正確"); }
+    };
+    reader.readAsText(file);
+  };
 
   const navItems = [
     { id:"episodes", icon:"mic", label:"Podcast 集數" },
@@ -1577,7 +1622,7 @@ function App() {
           {page==="library" && <LibraryPage flashcards={flashcards} onDelete={handleDeleteCard} onTogglePin={handleTogglePin} onUpdateProf={handleUpdateProf} claudeKey={settings.claudeKey}/>}
           {page==="review" && <ReviewPage flashcards={flashcards} onUpdateProf={handleUpdateProf}/>}
           {page==="quiz" && <QuizPage flashcards={flashcards} episodes={episodes} claudeKey={settings.claudeKey}/>}
-          {page==="settings" && <SettingsPage settings={settings} onSave={handleSaveSettings}/>}
+          {page==="settings" && <SettingsPage settings={settings} onSave={handleSaveSettings} onExport={handleExport} onImportBackup={handleImportBackup}/>}
         </div>
         {/* Mobile bottom navigation */}
         <nav className="bottom-nav">
