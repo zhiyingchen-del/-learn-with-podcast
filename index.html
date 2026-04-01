@@ -2,8 +2,10 @@
 <html lang="zh-TW">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>Learn with Podcast</title>
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙️</text></svg>" />
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -272,11 +274,14 @@ const styles = `
     --font-zh:'Noto Sans TC',sans-serif;
     --font-mono:'DM Mono',monospace;
     --shadow:0 4px 24px rgba(0,0,0,0.4); --shadow-lg:0 8px 40px rgba(0,0,0,0.6);
+    --bottom-nav-h:64px;
   }
-  body { background:var(--bg); color:var(--text); font-family:var(--font); }
+  body { background:var(--bg); color:var(--text); font-family:var(--font); -webkit-tap-highlight-color:transparent; }
   ::-webkit-scrollbar { width:4px; height:4px; }
   ::-webkit-scrollbar-track { background:transparent; }
   ::-webkit-scrollbar-thumb { background:var(--border2); border-radius:4px; }
+
+  /* ── LAYOUT ── */
   .app { display:flex; height:100vh; overflow:hidden; }
   .sidebar { width:220px; flex-shrink:0; background:var(--bg2); border-right:1px solid var(--border); display:flex; flex-direction:column; padding:20px 0; gap:4px; }
   .sidebar-logo { padding:0 20px 20px; border-bottom:1px solid var(--border); margin-bottom:8px; }
@@ -287,9 +292,112 @@ const styles = `
   .nav-item:hover { color:var(--text); background:rgba(255,255,255,0.04); }
   .nav-item.active { color:var(--accent2); background:var(--accent-bg); font-weight:500; }
   .main { flex:1; display:flex; flex-direction:column; overflow:hidden; }
-  .topbar { height:56px; border-bottom:1px solid var(--border); display:flex; align-items:center; padding:0 24px; gap:12px; flex-shrink:0; background:var(--bg2); }
-  .topbar h2 { font-size:16px; font-weight:600; flex:1; }
+  .topbar { height:56px; border-bottom:1px solid var(--border); display:flex; align-items:center; padding:0 16px; gap:12px; flex-shrink:0; background:var(--bg2); }
+  .topbar h2 { font-size:16px; font-weight:600; flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .content { flex:1; overflow-y:auto; padding:24px; }
+
+  /* ── BOTTOM NAV (mobile only) ── */
+  .bottom-nav { display:none; }
+
+  /* ── WORD PANEL (mobile = full screen) ── */
+  .word-panel { position:fixed; right:0; top:0; bottom:0; width:350px; background:var(--bg2); border-left:1px solid var(--border); z-index:200; display:flex; flex-direction:column; transform:translateX(100%); transition:transform 0.25s cubic-bezier(0.4,0,0.2,1); box-shadow:var(--shadow-lg); }
+  .word-panel.open { transform:translateX(0); }
+
+  /* ── MOBILE BREAKPOINT ── */
+  @media (max-width: 768px) {
+    .sidebar { display:none; }
+    .app { flex-direction:column; }
+    .main { padding-bottom:var(--bottom-nav-h); }
+    .content { padding:16px; }
+    .topbar { padding:0 14px; height:52px; }
+    .topbar h2 { font-size:15px; }
+
+    /* Bottom navigation */
+    .bottom-nav {
+      display:flex;
+      position:fixed;
+      bottom:0; left:0; right:0;
+      height:var(--bottom-nav-h);
+      background:var(--bg2);
+      border-top:1px solid var(--border);
+      z-index:150;
+      padding-bottom:env(safe-area-inset-bottom);
+    }
+    .bottom-nav-item {
+      flex:1;
+      display:flex;
+      flex-direction:column;
+      align-items:center;
+      justify-content:center;
+      gap:3px;
+      background:none;
+      border:none;
+      color:var(--text3);
+      cursor:pointer;
+      padding:8px 4px;
+      font-size:10px;
+      font-family:var(--font-zh);
+      transition:color 0.15s;
+      position:relative;
+    }
+    .bottom-nav-item.active { color:var(--accent2); }
+    .bottom-nav-item .nav-badge {
+      position:absolute;
+      top:6px; right:calc(50% - 16px);
+      background:var(--accent);
+      color:white;
+      font-size:9px;
+      min-width:14px;
+      height:14px;
+      border-radius:7px;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      padding:0 3px;
+    }
+
+    /* Word panel full screen on mobile */
+    .word-panel { width:100%; left:0; border-left:none; top:0; }
+
+    /* Player compact on mobile */
+    .player { padding:10px 14px; }
+    .player-top { gap:10px; margin-bottom:8px; }
+    .play-btn { width:44px; height:44px; }
+    .ctrl-btn { padding:8px; }
+    .player-title { font-size:13px; }
+    .player-sub { font-size:11px; }
+
+    /* Flashcard single column */
+    .flashcard-grid { grid-template-columns:1fr; }
+
+    /* Episode items */
+    .episode-thumb { width:44px; height:44px; font-size:18px; }
+    .episode-title { font-size:13.5px; }
+
+    /* Transcript */
+    .transcript-sentence { font-size:15px; padding:10px 10px; }
+
+    /* Modals full screen */
+    .modal { width:100% !important; max-width:100vw !important; border-radius:var(--radius-xl) var(--radius-xl) 0 0 !important; position:fixed; bottom:0; left:0; right:0; max-height:90vh; overflow-y:auto; }
+    .modal-overlay { align-items:flex-end; }
+
+    /* Quiz card */
+    .quiz-card { padding:20px 16px; border-radius:var(--radius-lg); }
+
+    /* Stats grid */
+    .stat-grid-3 { grid-template-columns:1fr 1fr; }
+
+    /* Review card */
+    .review-card-outer { height:220px; }
+
+    /* Buttons larger touch targets */
+    .btn { min-height:40px; }
+    .btn-sm { min-height:34px; }
+
+    /* Progress bar easier to tap */
+    .progress-bar { height:6px; margin-bottom:4px; }
+    .progress-fill::after { width:16px; height:16px; right:-8px; top:-5px; }
+  }
   .btn { display:inline-flex; align-items:center; gap:6px; padding:8px 16px; border-radius:var(--radius); font-size:13px; font-weight:500; cursor:pointer; border:1px solid transparent; transition:all 0.15s; font-family:var(--font); white-space:nowrap; }
   .btn-primary { background:var(--accent); color:white; border-color:var(--accent); }
   .btn-primary:hover { background:var(--accent2); border-color:var(--accent2); }
@@ -410,6 +518,7 @@ const styles = `
   @keyframes spin { to { transform: rotate(360deg); } }
   .spin { animation: spin 1s linear infinite; }
   .api-key-input { font-family:var(--font-mono); font-size:13px; }
+  .stat-grid-3 { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-bottom:24px; }
   .error-box { background:var(--coral-bg); border:1px solid rgba(255,107,107,0.3); border-radius:var(--radius); padding:12px 16px; font-size:13px; color:var(--coral); display:flex; gap:10px; align-items:flex-start; margin-bottom:16px; }
   .success-box { background:var(--green-bg); border:1px solid rgba(81,207,102,0.2); border-radius:var(--radius); padding:12px 16px; font-size:13px; color:var(--green); }
   .rss-episode-list { max-height:340px; overflow-y:auto; border:1px solid var(--border); border-radius:var(--radius-lg); }
@@ -800,7 +909,7 @@ const EpisodesPage = ({ episodes, onSelectEpisode, onImport, openaiKey }) => {
         <button className="btn btn-primary" onClick={()=>setShowImport(true)}><Icon name="plus" size={15}/>匯入</button>
       </div>
       <div className="content">
-        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:12,marginBottom:24}}>
+        <div className="stat-grid-3">
           {[[episodes.length,"集 Podcast"],[episodes.filter(e=>e.hasTranscript).length,"已有逐字稿"],[episodes.filter(e=>e.language==="fr").length,"法文集數"]].map(([v,l])=>(
             <div key={l} className="stat-card"><div className="stat-value" style={{color:"var(--accent2)"}}>{v}</div><div className="stat-label">{l}</div></div>
           ))}
@@ -1436,6 +1545,23 @@ function App() {
           {page==="quiz" && <QuizPage flashcards={flashcards} episodes={episodes} claudeKey={settings.claudeKey}/>}
           {page==="settings" && <SettingsPage settings={settings} onSave={handleSaveSettings}/>}
         </div>
+        {/* Mobile bottom navigation */}
+        <nav className="bottom-nav">
+          {[
+            {id:"episodes",icon:"mic",label:"集數"},
+            {id:"player",icon:"play",label:"播放"},
+            {id:"library",icon:"layers",label:"字卡"},
+            {id:"review",icon:"repeat",label:"複習"},
+            {id:"quiz",icon:"brain",label:"測驗"},
+            {id:"settings",icon:"settings",label:"設定"},
+          ].map(item => (
+            <button key={item.id} className={`bottom-nav-item ${page===item.id?"active":""}`} onClick={()=>setPage(item.id)}>
+              <Icon name={item.icon} size={20}/>
+              {item.id==="library" && flashcards.length>0 && <span className="nav-badge">{flashcards.length}</span>}
+              <span>{item.label}</span>
+            </button>
+          ))}
+        </nav>
       </div>
     </>
   );
