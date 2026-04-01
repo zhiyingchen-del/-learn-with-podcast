@@ -1,5 +1,4 @@
-export default async function handler(req, res) {
-  // Allow CORS from same origin
+module.exports = async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -17,7 +16,7 @@ export default async function handler(req, res) {
   let targetUrl;
   try {
     targetUrl = decodeURIComponent(url);
-    new URL(targetUrl); // validate
+    new URL(targetUrl);
   } catch {
     return res.status(400).json({ error: "Invalid URL" });
   }
@@ -35,22 +34,19 @@ export default async function handler(req, res) {
  
     if (!response.ok) {
       return res.status(response.status).json({
-        error: `Upstream error: ${response.status} ${response.statusText}`,
+        error: "Upstream error: " + response.status + " " + response.statusText,
       });
     }
  
     const contentType = response.headers.get("content-type") || "";
  
     if (type === "audio") {
-      // Stream audio back
       res.setHeader("Content-Type", contentType || "audio/mpeg");
       const contentLength = response.headers.get("content-length");
       if (contentLength) res.setHeader("Content-Length", contentLength);
- 
       const buffer = await response.arrayBuffer();
       return res.send(Buffer.from(buffer));
     } else {
-      // Return RSS/text content
       res.setHeader("Content-Type", contentType || "application/xml");
       const text = await response.text();
       return res.send(text);
@@ -58,4 +54,5 @@ export default async function handler(req, res) {
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
-}
+};
+ 
