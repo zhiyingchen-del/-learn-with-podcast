@@ -1,4 +1,4 @@
-module.exports = async function handler(req, res) {
+export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -8,10 +8,7 @@ module.exports = async function handler(req, res) {
   }
  
   const { url, type } = req.query;
- 
-  if (!url) {
-    return res.status(400).json({ error: "Missing url parameter" });
-  }
+  if (!url) return res.status(400).json({ error: "Missing url" });
  
   let targetUrl;
   try {
@@ -34,7 +31,7 @@ module.exports = async function handler(req, res) {
  
     if (!response.ok) {
       return res.status(response.status).json({
-        error: "Upstream error: " + response.status + " " + response.statusText,
+        error: "Upstream error: " + response.status,
       });
     }
  
@@ -47,12 +44,12 @@ module.exports = async function handler(req, res) {
       const buffer = await response.arrayBuffer();
       return res.send(Buffer.from(buffer));
     } else {
-      res.setHeader("Content-Type", contentType || "application/xml");
+      res.setHeader("Content-Type", contentType || "application/xml; charset=utf-8");
       const text = await response.text();
       return res.send(text);
     }
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
-};
+}
  
