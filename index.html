@@ -987,7 +987,7 @@ const EpisodesPage = ({ episodes, onSelectEpisode, onImport, openaiKey }) => {
 // ============================================================
 // PAGE: PLAYER
 // ============================================================
-const PlayerPage = ({ episode, onUpdateEpisode, onAddCard, flashcards, claudeKey, openaiKey }) => {
+const PlayerPage = ({ episode, onUpdateEpisode, onAddCard, flashcards, claudeKey, openaiKey, groqKey, whisperProvider }) => {
   const audioRef = useRef(null);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -1057,7 +1057,7 @@ const PlayerPage = ({ episode, onUpdateEpisode, onAddCard, flashcards, claudeKey
     try {
       const segs = await transcribeAudio(ep.audioUrl, openaiKey, ep.language, (msg, pct) => {
         setTransMsg(msg + " (" + pct + "%)");
-      }, settings?.groqKey, settings?.whisperProvider);
+      }, groqKey, whisperProvider);
       onUpdateEpisode({ ...ep, hasTranscript:true, transcript:segs });
     } catch(e) { setTransError(e.message); } finally { setTranscribing(false); }
   };
@@ -1661,7 +1661,7 @@ function App() {
         </div>
         <div className="main">
           {page==="episodes" && <EpisodesPage episodes={episodes} onSelectEpisode={handleSelectEpisode} onImport={handleImport} openaiKey={settings.openaiKey}/>}
-          {page==="player" && <PlayerPage episode={currentEpisode} onUpdateEpisode={handleUpdateEpisode} onAddCard={handleAddCard} flashcards={flashcards} claudeKey={settings.claudeKey} openaiKey={settings.openaiKey}/>}
+          {page==="player" && <PlayerPage episode={currentEpisode} onUpdateEpisode={handleUpdateEpisode} onAddCard={handleAddCard} flashcards={flashcards} claudeKey={settings.claudeKey} openaiKey={settings.openaiKey} groqKey={settings.groqKey} whisperProvider={settings.whisperProvider||"groq"}/>}
           {page==="library" && <LibraryPage flashcards={flashcards} onDelete={handleDeleteCard} onTogglePin={handleTogglePin} onUpdateProf={handleUpdateProf} claudeKey={settings.claudeKey}/>}
           {page==="review" && <ReviewPage flashcards={flashcards} onUpdateProf={handleUpdateProf}/>}
           {page==="quiz" && <QuizPage flashcards={flashcards} episodes={episodes} claudeKey={settings.claudeKey}/>}
