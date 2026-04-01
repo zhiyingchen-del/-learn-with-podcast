@@ -55,56 +55,81 @@ async function parseRSS(url) {
   };
 }
 
-async function transcribeAudio(audioUrl, openaiKey, language) {
-  // Step 1: Download audio via our Vercel proxy (server-side, no CORS)
-  // Step 2: Send to Whisper API directly from browser
-  // For long audio: proxy downloads chunks, whisper handles it
-  
-  // First try: send URL to our proxy which will stream to Whisper
-  const whisperProxyUrl = "/api/whisper";
-  const proxyRes = await fetch(whisperProxyUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ audioUrl, openaiKey, language }),
-  });
-  
-  if (proxyRes.ok) {
-    const data = await proxyRes.json();
-    if (data.segments) {
-      return data.segments.map((seg, i) => ({
-        id: i, start: seg.start, end: seg.end, text: seg.text.trim(),
-      }));
+async function transcribeAudio(audioUrl, openaiKey, language, onProgress) {
+  // Download audio in chunks via proxy, then send each chunk to Whisper from browser
+  // This avoids Vercel timeout — each chunk is processed independently
+  const CHUNK_SIZE = 18 * 1024 * 1024; // 18MB per chunk (~18 mins of audio)
+  const langCode = language === "fr" ? "fr" : "en";
+
+  async function sendChunkToWhisper(blob, timeOffset) {
+    const formData = new FormData();
+    formData.append("file", blob, "audio.mp3");
+    formData.append("model", "whisper-1");
+    formData.append("language", langCode);
+    formData.append("response_format", "verbose_json");
+    formData.append("timestamp_granularities[]", "segment");
+    const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+      method: "POST",
+      headers: { Authorization: "Bearer " + openaiKey },
+      body: formData,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err?.error?.message || "Whisper API 錯誤：" + res.status);
     }
-    if (data.error) throw new Error(data.error);
+    const data = await res.json();
+    return (data.segments || []).map(seg => ({
+      start: seg.start + timeOffset,
+      end: seg.end + timeOffset,
+      text: seg.text.trim(),
+    }));
   }
-  
-  // Fallback: download audio via proxy then send to Whisper directly
-  const audioProxyUrl = "/api/proxy?type=audio&url=" + encodeURIComponent(audioUrl);
-  const audioRes = await fetch(audioProxyUrl);
-  if (!audioRes.ok) throw new Error("無法下載音訊（" + audioRes.status + "），請確認音訊連結是否正確");
-  const audioBlob = await audioRes.blob();
-  if (audioBlob.size < 1000) throw new Error("音訊檔案過小，下載可能失敗");
 
-  const formData = new FormData();
-  formData.append("file", audioBlob, "audio.mp3");
-  formData.append("model", "whisper-1");
-  formData.append("language", language === "fr" ? "fr" : "en");
-  formData.append("response_format", "verbose_json");
-  formData.append("timestamp_granularities[]", "segment");
-
-  const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-    method: "POST",
-    headers: { Authorization: "Bearer " + openaiKey },
-    body: formData,
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err?.error?.message || "Whisper API 錯誤：" + res.status);
+  // Step 1: Get file size via proxy HEAD request
+  const headRes = await fetch("/api/proxy?url=" + encodeURIComponent(audioUrl), { method: "GET", headers: { Range: "bytes=0-0" } });
+  let totalSize = 0;
+  const contentRange = headRes.headers.get("content-range");
+  const contentLength = headRes.headers.get("content-length");
+  if (contentRange) {
+    const match = contentRange.match(/\/(\d+)$/);
+    if (match) totalSize = parseInt(match[1]);
   }
-  const data = await res.json();
-  return (data.segments || []).map((seg, i) => ({
-    id: i, start: seg.start, end: seg.end, text: seg.text.trim(),
-  }));
+  if (!totalSize && contentLength) totalSize = parseInt(contentLength);
+
+  let allSegments = [];
+
+  if (!totalSize || totalSize <= CHUNK_SIZE) {
+    // Small file: download all at once
+    if (onProgress) onProgress("下載音訊中...", 10);
+    const audioRes = await fetch("/api/proxy?type=audio&url=" + encodeURIComponent(audioUrl));
+    if (!audioRes.ok) throw new Error("無法下載音訊（" + audioRes.status + "）");
+    const blob = await audioRes.blob();
+    if (onProgress) onProgress("送出 Whisper 辨識中...", 40);
+    allSegments = await sendChunkToWhisper(blob, 0);
+  } else {
+    // Large file: chunk it
+    const numChunks = Math.ceil(totalSize / CHUNK_SIZE);
+    const secsPerByte = (2 * 3600) / totalSize; // rough estimate: 2hr per totalSize bytes
+
+    for (let i = 0; i < numChunks; i++) {
+      const start = i * CHUNK_SIZE;
+      const end = Math.min((i + 1) * CHUNK_SIZE - 1, totalSize - 1);
+      const timeOffset = Math.round(start * secsPerByte);
+      const pct = Math.round(((i) / numChunks) * 90);
+      if (onProgress) onProgress(`下載第 ${i+1}/${numChunks} 段並辨識中...`, pct);
+
+      const chunkRes = await fetch("/api/proxy?url=" + encodeURIComponent(audioUrl), {
+        headers: { Range: "bytes=" + start + "-" + end }
+      });
+      if (!chunkRes.ok) throw new Error("分段下載失敗（第 " + (i+1) + " 段）");
+      const blob = await chunkRes.blob();
+      const segments = await sendChunkToWhisper(blob, timeOffset);
+      allSegments.push(...segments);
+    }
+  }
+
+  if (onProgress) onProgress("完成！", 100);
+  return allSegments.map((s, i) => ({ id: i, start: s.start, end: s.end, text: s.text }));
 }
 
 async function claudeCall(prompt, claudeKey, maxTokens = 1000) {
@@ -823,6 +848,7 @@ const PlayerPage = ({ episode, onUpdateEpisode, onAddCard, flashcards, claudeKey
   const [selectedSentence, setSelectedSentence] = useState("");
   const [transcribing, setTranscribing] = useState(false);
   const [transError, setTransError] = useState("");
+  const [transMsg, setTransMsg] = useState("");
   const transcriptRef = useRef(null);
   const speeds = [0.75, 1, 1.25, 1.5];
   const ep = episode || { title:"尚未選擇集數", podcast:"", audioUrl:"", language:"en", hasTranscript:false, transcript:[] };
@@ -877,7 +903,9 @@ const PlayerPage = ({ episode, onUpdateEpisode, onAddCard, flashcards, claudeKey
     if (!ep.audioUrl) { setTransError("此集數沒有音訊連結"); return; }
     setTranscribing(true); setTransError("");
     try {
-      const segs = await transcribeAudio(ep.audioUrl, openaiKey, ep.language);
+      const segs = await transcribeAudio(ep.audioUrl, openaiKey, ep.language, (msg, pct) => {
+        setTransMsg(msg + " (" + pct + "%)");
+      });
       onUpdateEpisode({ ...ep, hasTranscript:true, transcript:segs });
     } catch(e) { setTransError(e.message); } finally { setTranscribing(false); }
   };
@@ -901,7 +929,7 @@ const PlayerPage = ({ episode, onUpdateEpisode, onAddCard, flashcards, claudeKey
             <p>使用 OpenAI Whisper 自動生成，支援英文與法文辨識</p>
             {transError && <div className="error-box" style={{textAlign:"left"}}><Icon name="alertCircle" size={15}/>{transError}</div>}
             <button className="btn btn-primary" onClick={handleTranscribe} disabled={transcribing}>
-              {transcribing ? <><span style={{display:"inline-block",animation:"spin 1s linear infinite"}}><Icon name="loader" size={14}/></span>辨識中…（依音訊長度需數分鐘）</> : "生成逐字稿"}
+              {transcribing ? <><span style={{display:"inline-block",animation:"spin 1s linear infinite"}}><Icon name="loader" size={14}/></span>{transMsg || "準備中..."}</> : "生成逐字稿"}
             </button>
             {transcribing && <div className="processing-bar" style={{width:280}}><div className="processing-fill"/></div>}
           </div>
