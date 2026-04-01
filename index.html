@@ -58,9 +58,7 @@ async function parseRSS(url) {
 }
 
 async function transcribeAudio(audioUrl, openaiKey, language, onProgress) {
-  // Download audio in chunks via proxy, then send each chunk to Whisper from browser
-  // This avoids Vercel timeout — each chunk is processed independently
-  const CHUNK_SIZE = 18 * 1024 * 1024; // 18MB per chunk (~18 mins of audio)
+  const CHUNK_SIZE = 18 * 1024 * 1024; // 18MB per chunk
   const langCode = language === "fr" ? "fr" : "en";
 
   async function sendChunkToWhisper(blob, timeOffset) {
@@ -80,15 +78,20 @@ async function transcribeAudio(audioUrl, openaiKey, language, onProgress) {
       throw new Error(err?.error?.message || "Whisper API 錯誤：" + res.status);
     }
     const data = await res.json();
-    return (data.segments || []).map(seg => ({
+    // duration 是 Whisper 回報這段音訊的實際長度（秒）
+    const chunkDuration = data.duration || 0;
+    const segments = (data.segments || []).map(seg => ({
       start: seg.start + timeOffset,
       end: seg.end + timeOffset,
       text: seg.text.trim(),
     }));
+    return { segments, chunkDuration };
   }
 
-  // Step 1: Get file size via proxy HEAD request
-  const headRes = await fetch("/api/proxy?url=" + encodeURIComponent(audioUrl), { method: "GET", headers: { Range: "bytes=0-0" } });
+  // 取得檔案大小
+  const headRes = await fetch("/api/proxy?url=" + encodeURIComponent(audioUrl), {
+    headers: { Range: "bytes=0-0" }
+  });
   let totalSize = 0;
   const contentRange = headRes.headers.get("content-range");
   const contentLength = headRes.headers.get("content-length");
@@ -101,32 +104,41 @@ async function transcribeAudio(audioUrl, openaiKey, language, onProgress) {
   let allSegments = [];
 
   if (!totalSize || totalSize <= CHUNK_SIZE) {
-    // Small file: download all at once
     if (onProgress) onProgress("下載音訊中...", 10);
     const audioRes = await fetch("/api/proxy?type=audio&url=" + encodeURIComponent(audioUrl));
     if (!audioRes.ok) throw new Error("無法下載音訊（" + audioRes.status + "）");
     const blob = await audioRes.blob();
-    if (onProgress) onProgress("送出 Whisper 辨識中...", 40);
-    allSegments = await sendChunkToWhisper(blob, 0);
+    if (onProgress) onProgress("Whisper 辨識中...", 40);
+    const { segments } = await sendChunkToWhisper(blob, 0);
+    allSegments = segments;
   } else {
-    // Large file: chunk it
     const numChunks = Math.ceil(totalSize / CHUNK_SIZE);
-    const secsPerByte = (2 * 3600) / totalSize; // rough estimate: 2hr per totalSize bytes
+    // 用 Whisper 回報的實際時長累積，不靠估算
+    let accumulatedTime = 0;
 
     for (let i = 0; i < numChunks; i++) {
       const start = i * CHUNK_SIZE;
       const end = Math.min((i + 1) * CHUNK_SIZE - 1, totalSize - 1);
-      const timeOffset = Math.round(start * secsPerByte);
-      const pct = Math.round(((i) / numChunks) * 90);
-      if (onProgress) onProgress(`下載第 ${i+1}/${numChunks} 段並辨識中...`, pct);
+      const pct = Math.round((i / numChunks) * 90);
+      if (onProgress) onProgress("第 " + (i+1) + "/" + numChunks + " 段辨識中...", pct);
 
       const chunkRes = await fetch("/api/proxy?url=" + encodeURIComponent(audioUrl), {
         headers: { Range: "bytes=" + start + "-" + end }
       });
       if (!chunkRes.ok) throw new Error("分段下載失敗（第 " + (i+1) + " 段）");
       const blob = await chunkRes.blob();
-      const segments = await sendChunkToWhisper(blob, timeOffset);
+
+      // 傳入累積的實際時長作為 offset，而非估算值
+      const { segments, chunkDuration } = await sendChunkToWhisper(blob, accumulatedTime);
       allSegments.push(...segments);
+
+      // 用 Whisper 回報的實際時長累積，廣告時長也自動包含在內
+      if (chunkDuration > 0) {
+        accumulatedTime += chunkDuration;
+      } else if (segments.length > 0) {
+        // fallback：用最後一段的結束時間
+        accumulatedTime = segments[segments.length - 1].end;
+      }
     }
   }
 
